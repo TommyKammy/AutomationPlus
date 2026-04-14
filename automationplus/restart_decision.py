@@ -7,11 +7,15 @@ from typing import Any, Dict, List, Optional
 
 RESTART_DECISION_SCHEMA_VERSION = 1
 RESTART_BUDGET_SCHEMA_VERSION = 1
+RESTART_CONTROL_BLOCK_SCHEMA_VERSION = 1
 DEFAULT_RESTART_DECISION_RELATIVE_PATH = (
     Path(".codex-supervisor") / "health" / "restart-decision.json"
 )
 DEFAULT_RESTART_BUDGET_RELATIVE_PATH = (
     Path(".codex-supervisor") / "health" / "restart-budget.json"
+)
+DEFAULT_RESTART_CONTROL_BLOCK_RELATIVE_PATH = (
+    Path(".codex-supervisor") / "health" / "restart-control-block.json"
 )
 DEFAULT_MAX_RESTARTS = 2
 DEFAULT_WINDOW_SECONDS = 900
@@ -44,6 +48,13 @@ def _write_json_atomic(path: Path, payload: dict) -> None:
         handle.write("\n")
         temp_path = Path(handle.name)
     temp_path.replace(path)
+
+
+def _remove_file_if_present(path: Path) -> None:
+    try:
+        Path(path).unlink()
+    except FileNotFoundError:
+        return
 
 
 def _empty_budget_state() -> dict:
@@ -121,21 +132,134 @@ def _allowed_restart_count(history: List[dict]) -> int:
     return sum(1 for item in history if item.get("allowed") is True)
 
 
-def _decision_reason(loop_status_payload: dict) -> str:
+def _decision_outcome(loop_status_payload: dict) -> dict:
     failure_policy = loop_status_payload.get("failurePolicy")
     if not isinstance(failure_policy, dict):
-        return "missing_failure_policy"
+        return {
+            "reasonCode": "missing_failure_policy",
+            "action": "hold",
+            "route": "hold",
+        }
+
+    degraded_state = failure_policy.get("degradedState")
+
+    if degraded_state == "repeated-failure":
+        return {
+            "reasonCode": "repeated_failure_auto_stop",
+            "action": "stop",
+            "route": "quarantine",
+        }
 
     if failure_policy.get("operatorHold") is True:
-        return "unsafe_failure_policy"
+        return {
+            "reasonCode": "unsafe_failure_policy",
+            "action": "hold",
+            "route": "hold",
+        }
 
-    if failure_policy.get("degradedState") != "transient-failure":
-        return "restart_not_eligible"
+    if degraded_state != "transient-failure":
+        return {
+            "reasonCode": "restart_not_eligible",
+            "action": "stop",
+            "route": None,
+        }
 
     if failure_policy.get("restartEligible") is not True:
-        return "restart_not_eligible"
+        return {
+            "reasonCode": "restart_not_eligible",
+            "action": "stop",
+            "route": None,
+        }
 
-    return "transient_restart_allowed"
+    return {
+        "reasonCode": "transient_restart_allowed",
+        "action": "restart",
+        "route": None,
+    }
+
+
+def _blocking_details(
+    *,
+    reason_code: str,
+    action: str,
+    route: Optional[str],
+    summary: Optional[str],
+    signature: Optional[dict],
+    used_before_decision: int,
+    max_restarts: int,
+    window_seconds: int,
+) -> Optional[dict]:
+    if action == "restart":
+        return None
+
+    signature_count = signature.get("count") if isinstance(signature, dict) else None
+    signature_id = signature.get("id") if isinstance(signature, dict) else None
+    normalized_summary = (
+        signature.get("normalizedSummary") if isinstance(signature, dict) else None
+    )
+
+    if reason_code == "repeated_failure_auto_stop":
+        blocking_summary = (
+            "Automation stopped restarting after the same repeated failure "
+            f"signature was observed {signature_count or 0} times."
+        )
+        resume_hint = (
+            "Review the repeated failure signature and clear the quarantine "
+            "intentionally before restarting the loop."
+        )
+    elif reason_code == "restart_budget_exhausted":
+        blocking_summary = (
+            "Automation stopped unattended restarts after exhausting the "
+            f"restart budget of {max_restarts} attempts within {window_seconds} seconds."
+        )
+        resume_hint = (
+            "Review the recent restart history before attempting another restart."
+        )
+    elif reason_code == "unsafe_failure_policy":
+        blocking_summary = (
+            "Automation placed the loop on operator hold because the observed "
+            "failure state is unsafe or unclassified."
+        )
+        resume_hint = (
+            "Inspect the loop health snapshot and resolve the unsafe condition "
+            "before resuming service."
+        )
+    elif reason_code == "restart_not_eligible":
+        blocking_summary = (
+            "Automation refused an unattended restart because the current "
+            "failure state is not eligible for automatic recovery."
+        )
+        resume_hint = (
+            "Review the current failure classification and restart eligibility "
+            "before resuming service."
+        )
+    else:
+        blocking_summary = (
+            "Automation refused to continue unattended recovery and is waiting "
+            "for explicit operator intervention."
+        )
+        resume_hint = "Review the blocking details before resuming service."
+
+    return {
+        "route": route,
+        "action": action,
+        "reasonCode": reason_code,
+        "summary": blocking_summary,
+        "failureSummary": summary,
+        "signatureId": signature_id,
+        "signatureCount": signature_count,
+        "normalizedSummary": normalized_summary,
+        "usedRestartsBeforeDecision": used_before_decision,
+        "maxRestarts": max_restarts,
+        "windowSeconds": window_seconds,
+        "requiresOperatorAction": True,
+        "resumeHint": resume_hint,
+    }
+
+
+def _restart_control_block_path(output_path: Path) -> Path:
+    output_path = Path(output_path).resolve()
+    return output_path.with_name(DEFAULT_RESTART_CONTROL_BLOCK_RELATIVE_PATH.name)
 
 
 def build_restart_decision_artifact(
@@ -158,10 +282,15 @@ def build_restart_decision_artifact(
 
     history = _prune_history(history, evaluated_at=evaluated_at, window_seconds=window_seconds)
     used_before_decision = _allowed_restart_count(history)
-    reason_code = _decision_reason(loop_status_payload)
+    decision_outcome = _decision_outcome(loop_status_payload)
+    reason_code = decision_outcome["reasonCode"]
+    action = decision_outcome["action"]
+    route = decision_outcome["route"]
 
     if reason_code == "transient_restart_allowed" and used_before_decision >= max_restarts:
         reason_code = "restart_budget_exhausted"
+        action = "stop"
+        route = "quarantine"
 
     allowed = reason_code == "transient_restart_allowed"
     failure_policy = loop_status_payload.get("failurePolicy")
@@ -169,6 +298,16 @@ def build_restart_decision_artifact(
     signature_id = signature.get("id") if isinstance(signature, dict) else None
     degraded_state = failure_policy.get("degradedState") if isinstance(failure_policy, dict) else None
     summary = failure_policy.get("summary") if isinstance(failure_policy, dict) else None
+    blocking = _blocking_details(
+        reason_code=reason_code,
+        action=action,
+        route=route,
+        summary=summary,
+        signature=signature if isinstance(signature, dict) else None,
+        used_before_decision=used_before_decision,
+        max_restarts=max_restarts,
+        window_seconds=window_seconds,
+    )
 
     decision_entry = {
         "evaluatedAt": evaluated_at,
@@ -196,6 +335,7 @@ def build_restart_decision_artifact(
         "decision": {
             "allowed": allowed,
             "reasonCode": reason_code,
+            "action": action,
         },
         "failurePolicy": {
             "degradedState": degraded_state,
@@ -213,6 +353,7 @@ def build_restart_decision_artifact(
             "signature": signature,
         },
         "budget": budget,
+        "blocking": blocking,
         "sourceLoopStatus": {
             "capturedAt": loop_status_payload.get("capturedAt"),
             "status": loop_status_payload.get("status"),
@@ -250,5 +391,25 @@ def write_restart_decision_artifact(
         window_seconds=window_seconds,
     )
     _write_json_atomic(budget_path, next_budget_state)
+    block_artifact_path = _restart_control_block_path(output_path)
+    blocking = artifact.get("blocking")
+    routed_blocking = (
+        blocking if isinstance(blocking, dict) and blocking.get("route") is not None else None
+    )
+    if isinstance(routed_blocking, dict):
+        artifact["blockArtifactPath"] = str(block_artifact_path)
+        block_artifact = {
+            "schemaVersion": RESTART_CONTROL_BLOCK_SCHEMA_VERSION,
+            "artifactType": "restart_control_block",
+            "evaluatedAt": artifact.get("evaluatedAt"),
+            "route": routed_blocking.get("route"),
+            "decision": artifact.get("decision"),
+            "blocking": routed_blocking,
+            "failurePolicy": artifact.get("failurePolicy"),
+            "sourceDecisionArtifactPath": str(output_path),
+        }
+        _write_json_atomic(block_artifact_path, block_artifact)
     _write_json_atomic(output_path, artifact)
+    if routed_blocking is None:
+        _remove_file_if_present(block_artifact_path)
     return artifact
