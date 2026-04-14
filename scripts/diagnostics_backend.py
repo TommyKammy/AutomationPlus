@@ -39,6 +39,12 @@ COMMAND_MAP = {
         "supports_dry_run": False,
         "output_mode": "loop_status",
     },
+    "restart-decision": {
+        "supervisor_command": None,
+        "needs_issue_number": False,
+        "supports_dry_run": False,
+        "output_mode": "restart_decision",
+    },
     "run-once": {
         "supervisor_command": "run-once",
         "needs_issue_number": False,
@@ -69,7 +75,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from automationplus import loop_status
+from automationplus import loop_status, restart_decision
 
 DEFAULT_SUPERVISOR_ROOT = REPO_ROOT.parent.parent / "AutomationPlus-codex-supervisor"
 DEFAULT_SUPERVISOR_CMD = ["node", str(DEFAULT_SUPERVISOR_ROOT / "dist" / "index.js")]
@@ -294,6 +300,48 @@ def _load_loop_status_capture_lines() -> int:
     return value
 
 
+def _load_restart_decision_output_path(workspace_root: Path) -> Path:
+    raw = os.environ.get("AUTOMATIONPLUS_RESTART_DECISION_OUTPUT_PATH")
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return (workspace_root / restart_decision.DEFAULT_RESTART_DECISION_RELATIVE_PATH).resolve()
+
+
+def _load_restart_budget_path(workspace_root: Path) -> Path:
+    raw = os.environ.get("AUTOMATIONPLUS_RESTART_BUDGET_PATH")
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return (workspace_root / restart_decision.DEFAULT_RESTART_BUDGET_RELATIVE_PATH).resolve()
+
+
+def _load_restart_max_restarts() -> int:
+    raw = os.environ.get("AUTOMATIONPLUS_RESTART_MAX_RESTARTS")
+    if raw is None:
+        return restart_decision.DEFAULT_MAX_RESTARTS
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise BackendError(
+            "invalid_backend_config",
+            "AUTOMATIONPLUS_RESTART_MAX_RESTARTS must be an integer.",
+            env_var="AUTOMATIONPLUS_RESTART_MAX_RESTARTS",
+        ) from exc
+
+
+def _load_restart_window_seconds() -> int:
+    raw = os.environ.get("AUTOMATIONPLUS_RESTART_WINDOW_SECONDS")
+    if raw is None:
+        return restart_decision.DEFAULT_WINDOW_SECONDS
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise BackendError(
+            "invalid_backend_config",
+            "AUTOMATIONPLUS_RESTART_WINDOW_SECONDS must be an integer.",
+            env_var="AUTOMATIONPLUS_RESTART_WINDOW_SECONDS",
+        ) from exc
+
+
 def _run_supervisor(argv: List[str]) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(
@@ -448,7 +496,7 @@ def main() -> int:
             raise BackendError("invalid_backend_command", f"Unsupported diagnostics command: {command}")
 
         output_mode = str(command_spec["output_mode"])
-        if output_mode == "loop_status":
+        if output_mode in {"loop_status", "restart_decision"}:
             if issue_number is not None:
                 raise BackendError(
                     "invalid_backend_arguments",
@@ -463,12 +511,36 @@ def main() -> int:
                     command=command,
                 )
 
+            workspace_root = _load_loop_status_workspace_root()
             payload = loop_status.collect_loop_status(
                 supervisor_root=_load_loop_status_supervisor_root(),
-                workspace_root=_load_loop_status_workspace_root(),
+                workspace_root=workspace_root,
                 session_name=_load_loop_status_session_name(),
                 capture_lines=_load_loop_status_capture_lines(),
             )
+            if output_mode == "restart_decision":
+                decision_output_path = _load_restart_decision_output_path(workspace_root)
+                budget_path = _load_restart_budget_path(workspace_root)
+                decision_payload = restart_decision.write_restart_decision_artifact(
+                    output_path=decision_output_path,
+                    budget_path=budget_path,
+                    loop_status_payload=payload,
+                    max_restarts=_load_restart_max_restarts(),
+                    window_seconds=_load_restart_window_seconds(),
+                )
+                decision_payload.update(
+                    {
+                        "artifactPath": str(decision_output_path),
+                        "budgetPath": str(budget_path),
+                        "backend": "automationplus",
+                        "source_command": command,
+                        "supervisor_command": None,
+                        "issue_number": None,
+                        "argv": [command],
+                        "config_path": None,
+                    }
+                )
+                return _emit(decision_payload, stream=sys.stdout)
             payload.update(
                 {
                     "backend": "automationplus",
