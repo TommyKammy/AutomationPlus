@@ -152,6 +152,7 @@ def _base_finding(
 def build_post_epic_findings_pack(evaluation_artifact: dict[str, Any]) -> dict[str, Any]:
     generated_at = evaluation_artifact.get("generatedAt")
     target = copy.deepcopy(evaluation_artifact.get("target"))
+    evaluation = copy.deepcopy(evaluation_artifact.get("evaluation"))
     source_context = copy.deepcopy(evaluation_artifact.get("sourceContext", {}))
     child_issues = source_context.get("childIssues", [])
     related_pull_requests = source_context.get("relatedPullRequests", [])
@@ -275,6 +276,7 @@ def build_post_epic_findings_pack(evaluation_artifact: dict[str, Any]) -> dict[s
         "sourceArtifact": {
             "artifactType": evaluation_artifact.get("artifactType"),
             "generatedAt": generated_at,
+            "evaluation": evaluation,
             "target": target,
         },
         "routing": {
@@ -293,6 +295,237 @@ def build_post_epic_findings_pack(evaluation_artifact: dict[str, Any]) -> dict[s
             "suppressedLowValueCount": len(low_value_findings),
         },
     }
+
+
+def _follow_up_issue_dedupe_key(findings_pack: dict[str, Any]) -> str:
+    source_artifact = findings_pack.get("sourceArtifact")
+    if not isinstance(source_artifact, dict):
+        source_artifact = {}
+
+    evaluation = source_artifact.get("evaluation")
+    if not isinstance(evaluation, dict):
+        evaluation = {}
+
+    epic = evaluation.get("epic")
+    if isinstance(epic, dict) and epic.get("issueNumber") is not None:
+        return f"epic-follow-up:{epic['issueNumber']}"
+
+    target = source_artifact.get("target")
+    if not isinstance(target, dict):
+        target = {}
+
+    target_sha = target.get("sha", "unknown")
+    return f"epic-follow-up:target:{target_sha}"
+
+
+def _render_post_epic_follow_up_issue_body(
+    *,
+    epic_issue_number: Any,
+    epic_title: str,
+) -> str:
+    return "\n".join(
+        [
+            "## Summary",
+            f"Follow up on remaining post-epic work for #{epic_issue_number} {epic_title}.",
+            "",
+            "## Scope",
+            "- convert the post-epic findings pack into one execution-ready follow-up issue",
+            "- keep current-PR local-review residual routing excluded from this publish path",
+            "- carry forward actionable meta-only follow-up findings without silent promotion",
+            "",
+            "## Acceptance criteria",
+            "- the generated follow-up issue remains template-clean for codex-supervisor issue-lint",
+            "- the publish plan promotes only when issue-lint is execution-ready and free of blocking ambiguity",
+            "- unsafe or duplicate drafts are quarantined instead of being promoted",
+            "",
+            "## Verification",
+            "- python3 -m unittest tests.test_post_epic_evaluator",
+            "- review the generated issue body for required sections and scheduling metadata",
+            "",
+            f"Part of: #{epic_issue_number}",
+            "Depends on: none",
+            "Parallelizable: No",
+            "",
+            "## Execution order",
+            "1 of 1",
+        ]
+    )
+
+
+def _build_follow_up_draft_issue(
+    findings_pack: dict[str, Any],
+    source_findings: list[dict[str, Any]],
+) -> dict[str, Any]:
+    source_artifact = findings_pack.get("sourceArtifact")
+    if not isinstance(source_artifact, dict):
+        source_artifact = {}
+
+    evaluation = source_artifact.get("evaluation")
+    if not isinstance(evaluation, dict):
+        evaluation = {}
+
+    epic = evaluation.get("epic", {})
+    epic_issue_number = epic.get("issueNumber")
+    epic_title = epic.get("title", "Post-epic follow-up")
+
+    return {
+        "dedupeKey": _follow_up_issue_dedupe_key(findings_pack),
+        "title": f"Post-epic follow-up for #{epic_issue_number} {epic_title}",
+        "body": _render_post_epic_follow_up_issue_body(
+            epic_issue_number=epic_issue_number,
+            epic_title=epic_title,
+        ),
+        "labels": ["codex", "post-epic-follow-up"],
+        "state": "draft",
+        "findingCount": len(source_findings),
+    }
+
+
+def _issue_lint_blocking_details(issue_lint_result: dict[str, Any]) -> list[str]:
+    details: list[str] = []
+    missing_required = issue_lint_result.get("missingRequired", [])
+    metadata_errors = issue_lint_result.get("metadataErrors", [])
+    ambiguity = issue_lint_result.get("highRiskBlockingAmbiguity")
+
+    if missing_required:
+        details.append(
+            "issue-lint missing required fields: " + ", ".join(str(item) for item in missing_required)
+        )
+    if metadata_errors:
+        details.append(
+            "issue-lint metadata errors: " + "; ".join(str(item) for item in metadata_errors)
+        )
+    if ambiguity:
+        details.append(f"issue-lint blocking ambiguity: {ambiguity}")
+
+    return details
+
+
+def build_post_epic_follow_up_issue_publish_plan(
+    findings_pack: dict[str, Any],
+    *,
+    issue_lint_result: Optional[dict[str, Any]] = None,
+    existing_draft_keys: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    source_findings = copy.deepcopy(findings_pack.get("actionableFindings", []))
+    routing = copy.deepcopy(findings_pack.get("routing", {}))
+    source_artifact = findings_pack.get("sourceArtifact")
+    if not isinstance(source_artifact, dict):
+        source_artifact = {}
+
+    evaluation = source_artifact.get("evaluation")
+    if not isinstance(evaluation, dict):
+        evaluation = {}
+    evaluation = copy.deepcopy(evaluation)
+
+    target = source_artifact.get("target")
+    if isinstance(target, dict):
+        target = copy.deepcopy(target)
+    else:
+        target = None
+
+    existing_draft_keys = existing_draft_keys or []
+    draft_issue = _build_follow_up_draft_issue(findings_pack, source_findings)
+    dedupe_key = draft_issue["dedupeKey"]
+
+    quarantine_reason: Optional[str] = None
+    blocking_details: list[str] = []
+
+    if not source_findings:
+        quarantine_reason = "no_actionable_findings"
+        blocking_details.append("findings pack did not contain actionable follow-up findings")
+    elif routing.get("excludeCurrentPrResiduals") is not True:
+        quarantine_reason = "unsafe_routing"
+        blocking_details.append("publish path must exclude current-PR residual routing")
+    elif routing.get("sourceClassification") != "meta_only":
+        quarantine_reason = "unsafe_routing"
+        blocking_details.append("publish path only supports meta-only findings packs")
+    elif dedupe_key in existing_draft_keys:
+        quarantine_reason = "duplicate_draft"
+        blocking_details.append(f"draft already exists for dedupe key {dedupe_key}")
+    elif issue_lint_result is None:
+        quarantine_reason = "issue_lint_missing"
+        blocking_details.append("publish plan requires an issue-lint result before promotion")
+    else:
+        lint_missing_required = bool(issue_lint_result.get("missingRequired"))
+        lint_metadata_errors = bool(issue_lint_result.get("metadataErrors"))
+        lint_has_blocking_ambiguity = bool(issue_lint_result.get("highRiskBlockingAmbiguity"))
+
+        if (
+            not issue_lint_result.get("executionReady", False)
+            or lint_has_blocking_ambiguity
+            or lint_missing_required
+            or lint_metadata_errors
+        ):
+            quarantine_reason = "issue_lint_blocked"
+            blocking_details.extend(
+                _issue_lint_blocking_details(issue_lint_result)
+                or ["issue-lint did not mark this draft safe to promote"]
+            )
+
+    promotion = (
+        {"decision": "quarantine", "reason": quarantine_reason}
+        if quarantine_reason is not None
+        else {"decision": "promote", "reason": "issue_lint_clean"}
+    )
+
+    publish_plan = {
+        "schemaVersion": 1,
+        "artifactType": "post_epic_follow_up_issue_publish_plan",
+        "generatedAt": findings_pack.get("generatedAt"),
+        "sourceArtifact": {
+            "artifactType": findings_pack.get("artifactType"),
+            "generatedAt": findings_pack.get("generatedAt"),
+            "evaluation": evaluation,
+            "target": target,
+        },
+        "routing": {
+            "lane": routing.get("lane", "meta"),
+            "sourceClassification": routing.get("sourceClassification", "meta_only"),
+            "excludeCurrentPrResiduals": routing.get("excludeCurrentPrResiduals", True),
+            "publishTarget": "post_epic_follow_up",
+        },
+        "draftIssue": draft_issue,
+        "sourceFindings": source_findings,
+        "promotion": promotion,
+    }
+
+    if quarantine_reason is not None:
+        publish_plan["quarantine"] = {
+            "reason": quarantine_reason,
+            "blockingDetails": blocking_details,
+        }
+
+    return publish_plan
+
+
+def write_post_epic_follow_up_issue_publish_plan(
+    output_path: Path,
+    findings_pack: dict[str, Any],
+    *,
+    issue_lint_result: Optional[dict[str, Any]] = None,
+    existing_draft_keys: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    publish_plan = build_post_epic_follow_up_issue_publish_plan(
+        findings_pack,
+        issue_lint_result=issue_lint_result,
+        existing_draft_keys=existing_draft_keys,
+    )
+    output_path = Path(output_path).resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=str(output_path.parent),
+        delete=False,
+    ) as handle:
+        json.dump(publish_plan, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        temp_path = Path(handle.name)
+
+    temp_path.replace(output_path)
+    return publish_plan
 
 
 def write_post_epic_findings_pack(
