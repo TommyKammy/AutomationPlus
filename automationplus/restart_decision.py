@@ -189,7 +189,7 @@ def _blocking_details(
     max_restarts: int,
     window_seconds: int,
 ) -> Optional[dict]:
-    if route is None:
+    if action == "restart":
         return None
 
     signature_count = signature.get("count") if isinstance(signature, dict) else None
@@ -222,6 +222,15 @@ def _blocking_details(
         )
         resume_hint = (
             "Inspect the loop health snapshot and resolve the unsafe condition "
+            "before resuming service."
+        )
+    elif reason_code == "restart_not_eligible":
+        blocking_summary = (
+            "Automation refused an unattended restart because the current "
+            "failure state is not eligible for automatic recovery."
+        )
+        resume_hint = (
+            "Review the current failure classification and restart eligibility "
             "before resuming service."
         )
     else:
@@ -384,20 +393,23 @@ def write_restart_decision_artifact(
     _write_json_atomic(budget_path, next_budget_state)
     block_artifact_path = _restart_control_block_path(output_path)
     blocking = artifact.get("blocking")
-    if isinstance(blocking, dict):
+    routed_blocking = (
+        blocking if isinstance(blocking, dict) and blocking.get("route") is not None else None
+    )
+    if isinstance(routed_blocking, dict):
         artifact["blockArtifactPath"] = str(block_artifact_path)
         block_artifact = {
             "schemaVersion": RESTART_CONTROL_BLOCK_SCHEMA_VERSION,
             "artifactType": "restart_control_block",
             "evaluatedAt": artifact.get("evaluatedAt"),
-            "route": blocking.get("route"),
+            "route": routed_blocking.get("route"),
             "decision": artifact.get("decision"),
-            "blocking": blocking,
+            "blocking": routed_blocking,
             "failurePolicy": artifact.get("failurePolicy"),
             "sourceDecisionArtifactPath": str(output_path),
         }
         _write_json_atomic(block_artifact_path, block_artifact)
-    else:
-        _remove_file_if_present(block_artifact_path)
     _write_json_atomic(output_path, artifact)
+    if routed_blocking is None:
+        _remove_file_if_present(block_artifact_path)
     return artifact
