@@ -1,6 +1,8 @@
+import errno
 import hashlib
 import json
-import tempfile
+import os
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -14,22 +16,92 @@ DEFAULT_QUARANTINE_RELATIVE_PATH = (
 )
 
 
-def _write_text_atomic(path: Path, content: str) -> None:
-    path = Path(path).resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        "w",
-        encoding="utf-8",
-        dir=str(path.parent),
-        delete=False,
-    ) as handle:
-        handle.write(content)
-        temp_path = Path(handle.name)
-    temp_path.replace(path)
+class UnsafeGeneratedPathError(RuntimeError):
+    pass
 
 
-def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
-    _write_text_atomic(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+def _directory_open_flags() -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    return flags
+
+
+def _unsafe_path_error(exc: OSError) -> Optional[UnsafeGeneratedPathError]:
+    if exc.errno in {errno.ELOOP, errno.ENOENT, errno.ENOTDIR}:
+        return UnsafeGeneratedPathError("generated sync path is not safely reachable")
+    return None
+
+
+def _path_relative_to_root(path: Path, root: Path) -> Path:
+    try:
+        return path.relative_to(root)
+    except ValueError as exc:
+        raise UnsafeGeneratedPathError("generated sync path escaped its trusted root") from exc
+
+
+def _open_directory_no_symlinks(root: Path, relative_dir: Path) -> int:
+    if relative_dir.is_absolute():
+        raise UnsafeGeneratedPathError("relative directory must not be absolute")
+
+    current_fd = os.open(str(root), _directory_open_flags())
+    try:
+        for part in relative_dir.parts:
+            if part in ("", "."):
+                continue
+            if part == "..":
+                raise UnsafeGeneratedPathError("generated sync path escaped its trusted root")
+            try:
+                os.mkdir(part, dir_fd=current_fd)
+            except FileExistsError:
+                pass
+            try:
+                next_fd = os.open(part, _directory_open_flags(), dir_fd=current_fd)
+            except OSError as exc:
+                unsafe = _unsafe_path_error(exc)
+                if unsafe is not None:
+                    raise unsafe from exc
+                raise
+            os.close(current_fd)
+            current_fd = next_fd
+        return current_fd
+    except Exception:
+        os.close(current_fd)
+        raise
+
+
+def _write_text_atomic(root: Path, path: Path, content: str) -> None:
+    relative_path = _path_relative_to_root(path, root)
+    parent_fd = _open_directory_no_symlinks(root, relative_path.parent)
+    temp_name = f".automationplus-{uuid.uuid4().hex}.tmp"
+    temp_fd: Optional[int] = None
+    temp_created = False
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        temp_fd = os.open(temp_name, flags, 0o600, dir_fd=parent_fd)
+        temp_created = True
+        with os.fdopen(temp_fd, "wb") as handle:
+            temp_fd = None
+            handle.write(content.encode("utf-8"))
+        os.replace(temp_name, relative_path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        temp_created = False
+    finally:
+        if temp_fd is not None:
+            os.close(temp_fd)
+        if temp_created:
+            try:
+                os.unlink(temp_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+        os.close(parent_fd)
+
+
+def _write_json_atomic(root: Path, path: Path, payload: dict[str, Any]) -> None:
+    _write_text_atomic(root, path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
 def _relative_to_root(path: Path, root: Path) -> Optional[Path]:
@@ -134,7 +206,7 @@ def write_generated_note_sync(
             "status": "skipped",
             "reasonCode": "service_not_safe_for_generated_sync",
         }
-        _write_json_atomic(quarantine_path, artifact)
+        _write_json_atomic(workspace_root, quarantine_path, artifact)
         return artifact
 
     if not _path_allowed(output_path, vault_root):
@@ -142,10 +214,18 @@ def write_generated_note_sync(
             "status": "blocked",
             "reasonCode": "generated_path_not_allowed",
         }
-        _write_json_atomic(quarantine_path, artifact)
+        _write_json_atomic(workspace_root, quarantine_path, artifact)
         return artifact
 
-    _write_text_atomic(output_path, content)
+    try:
+        _write_text_atomic(vault_root, output_path, content)
+    except UnsafeGeneratedPathError:
+        artifact["decision"] = {
+            "status": "blocked",
+            "reasonCode": "generated_path_not_allowed",
+        }
+        _write_json_atomic(workspace_root, quarantine_path, artifact)
+        return artifact
     artifact["decision"] = {
         "status": "written",
         "reasonCode": "allowed_generated_path",

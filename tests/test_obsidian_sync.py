@@ -1,9 +1,11 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from automationplus.obsidian_sync import write_generated_note_sync
+import automationplus.obsidian_sync as obsidian_sync
 
 
 class ObsidianGeneratedSyncTests(unittest.TestCase):
@@ -29,7 +31,7 @@ class ObsidianGeneratedSyncTests(unittest.TestCase):
                 / "summary.md"
             )
 
-            artifact = write_generated_note_sync(
+            artifact = obsidian_sync.write_generated_note_sync(
                 workspace_root=workspace,
                 vault_root=workspace,
                 output_path=output_path,
@@ -54,7 +56,7 @@ class ObsidianGeneratedSyncTests(unittest.TestCase):
             workspace = Path(tempdir)
             blocked_path = workspace / "Notes" / "Project.md"
 
-            artifact = write_generated_note_sync(
+            artifact = obsidian_sync.write_generated_note_sync(
                 workspace_root=workspace,
                 vault_root=workspace,
                 output_path=blocked_path,
@@ -84,7 +86,7 @@ class ObsidianGeneratedSyncTests(unittest.TestCase):
                 / "summary.md"
             )
 
-            artifact = write_generated_note_sync(
+            artifact = obsidian_sync.write_generated_note_sync(
                 workspace_root=workspace,
                 vault_root=workspace,
                 output_path=output_path,
@@ -120,7 +122,7 @@ class ObsidianGeneratedSyncTests(unittest.TestCase):
                 / "summary.md"
             )
 
-            artifact = write_generated_note_sync(
+            artifact = obsidian_sync.write_generated_note_sync(
                 workspace_root=workspace,
                 vault_root=workspace,
                 output_path=output_path,
@@ -141,6 +143,41 @@ class ObsidianGeneratedSyncTests(unittest.TestCase):
             quarantine = json.loads(quarantine_path.read_text(encoding="utf-8"))
             self.assertEqual(quarantine["decision"]["status"], "skipped")
             self.assertIsNone(quarantine["serviceState"]["failurePolicy"].get("operatorHold"))
+
+    def test_generated_sync_blocks_symlink_swap_after_policy_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            workspace = Path(tempdir)
+            output_dir = workspace / "obsidian" / "generated" / "daily"
+            output_dir.mkdir(parents=True)
+            output_path = output_dir / "summary.md"
+            escaped_dir = workspace / "Notes"
+            escaped_dir.mkdir()
+            original_path_allowed = obsidian_sync._path_allowed
+
+            def swap_allowed_directory(candidate: Path, vault_root: Path) -> bool:
+                allowed = original_path_allowed(candidate, vault_root)
+                moved_dir = workspace / "daily-original"
+                output_dir.rename(moved_dir)
+                os.symlink(escaped_dir, output_dir, target_is_directory=True)
+                return allowed
+
+            with patch("automationplus.obsidian_sync._path_allowed", side_effect=swap_allowed_directory):
+                artifact = obsidian_sync.write_generated_note_sync(
+                    workspace_root=workspace,
+                    vault_root=workspace,
+                    output_path=output_path,
+                    content="# Daily Summary\n\nGenerated content.\n",
+                    loop_status_payload=self._healthy_loop_status(),
+                    generated_at="2026-04-15T10:00:00Z",
+                )
+
+            self.assertEqual(artifact["decision"]["status"], "blocked")
+            self.assertEqual(artifact["decision"]["reasonCode"], "generated_path_not_allowed")
+            self.assertFalse((escaped_dir / "summary.md").exists())
+            quarantine_path = workspace / ".codex-supervisor" / "generated" / "obsidian" / "quarantine.json"
+            quarantine = json.loads(quarantine_path.read_text(encoding="utf-8"))
+            self.assertEqual(quarantine["decision"]["status"], "blocked")
+            self.assertEqual(quarantine["requestedPath"], "obsidian/generated/daily/summary.md")
 
 
 if __name__ == "__main__":
