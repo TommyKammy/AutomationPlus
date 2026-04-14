@@ -382,10 +382,10 @@ def write_restart_decision_artifact(
         window_seconds=window_seconds,
     )
     _write_json_atomic(budget_path, next_budget_state)
-    _write_json_atomic(output_path, artifact)
     block_artifact_path = _restart_control_block_path(output_path)
     blocking = artifact.get("blocking")
     if isinstance(blocking, dict):
+        artifact["blockArtifactPath"] = str(block_artifact_path)
         block_artifact = {
             "schemaVersion": RESTART_CONTROL_BLOCK_SCHEMA_VERSION,
             "artifactType": "restart_control_block",
@@ -397,8 +397,7 @@ def write_restart_decision_artifact(
             "sourceDecisionArtifactPath": str(output_path),
         }
         _write_json_atomic(block_artifact_path, block_artifact)
-        artifact["blockArtifactPath"] = str(block_artifact_path)
-        _write_json_atomic(output_path, artifact)
     else:
         _remove_file_if_present(block_artifact_path)
+    _write_json_atomic(output_path, artifact)
     return artifact

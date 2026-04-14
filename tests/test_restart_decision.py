@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import automationplus.restart_decision as restart_decision
 
@@ -177,6 +178,42 @@ class RestartDecisionTests(unittest.TestCase):
             )
             self.assertEqual(block_artifact["artifactType"], "restart_control_block")
             self.assertEqual(block_artifact["route"], "quarantine")
+
+    def test_write_restart_decision_persists_control_block_before_blocked_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            decision_path = root / ".codex-supervisor" / "health" / "restart-decision.json"
+            budget_path = root / ".codex-supervisor" / "health" / "restart-budget.json"
+            writes: list[tuple[Path, dict]] = []
+
+            def capture_write(path: Path, payload: dict) -> None:
+                writes.append((Path(path).resolve(), dict(payload)))
+
+            with mock.patch.object(restart_decision, "_write_json_atomic", side_effect=capture_write):
+                artifact = restart_decision.write_restart_decision_artifact(
+                    output_path=decision_path,
+                    budget_path=budget_path,
+                    loop_status_payload=self._loop_status_payload(
+                        degraded_state="repeated-failure",
+                        restart_eligible=False,
+                        operator_hold=True,
+                        signature_count=2,
+                    ),
+                    evaluated_at="2026-04-15T09:10:05Z",
+                    max_restarts=2,
+                    window_seconds=900,
+                )
+
+            block_artifact_path = restart_decision._restart_control_block_path(decision_path)
+            self.assertEqual(
+                [path for path, _payload in writes],
+                [budget_path.resolve(), block_artifact_path, decision_path.resolve()],
+            )
+            self.assertEqual(
+                writes[-1][1]["blockArtifactPath"],
+                str(block_artifact_path),
+            )
+            self.assertEqual(artifact["blockArtifactPath"], str(block_artifact_path))
 
 
 if __name__ == "__main__":
