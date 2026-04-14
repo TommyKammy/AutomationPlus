@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 DEFAULT_CAPTURE_LINES = 20
 DEFAULT_SESSION_NAME = "automationplus-loop"
 DEFAULT_ARTIFACT_RELATIVE_PATH = Path(".codex-supervisor") / "health" / "loop-health.json"
+DEFAULT_TMUX_TIMEOUT_SECONDS = 5.0
 
 
 class HealthMirrorError(Exception):
@@ -28,7 +29,10 @@ def _read_json_file(path: Path) -> Optional[Any]:
 
     if not raw.strip():
         return None
-    return json.loads(raw)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
 
 
 def _tmux_capture_lines(stdout: str, limit: int) -> List[str]:
@@ -38,16 +42,25 @@ def _tmux_capture_lines(stdout: str, limit: int) -> List[str]:
     return lines[-limit:]
 
 
-def _run_tmux(*args: str) -> subprocess.CompletedProcess:
+def _run_tmux(
+    *args: str,
+    timeout: float = DEFAULT_TMUX_TIMEOUT_SECONDS,
+) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(
             ["tmux", *args],
             check=False,
             capture_output=True,
             text=True,
+            timeout=timeout,
         )
     except FileNotFoundError as exc:
         raise HealthMirrorError("tmux is not available on PATH") from exc
+    except subprocess.TimeoutExpired as exc:
+        command = " ".join(["tmux", *args])
+        raise HealthMirrorError(
+            f"tmux command timed out after {timeout:g}s: {command}"
+        ) from exc
     except OSError as exc:
         raise HealthMirrorError(f"Failed to invoke tmux: {exc}") from exc
 

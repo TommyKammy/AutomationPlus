@@ -1,4 +1,5 @@
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +9,45 @@ import automationplus.health_mirror as health_mirror
 
 
 class LoopHealthMirrorTests(unittest.TestCase):
+    def test_collect_loop_health_snapshot_treats_malformed_json_artifacts_as_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            supervisor_root = Path(tempdir)
+            local_state_path = supervisor_root / ".local" / "state.json"
+            turn_in_progress_path = supervisor_root / ".codex-supervisor" / "turn-in-progress.json"
+
+            local_state_path.parent.mkdir(parents=True, exist_ok=True)
+            turn_in_progress_path.parent.mkdir(parents=True, exist_ok=True)
+
+            local_state_path.write_text('{"activeIssueNumber": ', encoding="utf-8")
+            turn_in_progress_path.write_text('{"issueNumber": ', encoding="utf-8")
+
+            with mock.patch(
+                "automationplus.health_mirror._read_tmux_runtime",
+                return_value={
+                    "state": "running",
+                    "hostMode": "tmux",
+                    "sessionName": "automationplus-loop",
+                    "windowName": "loop",
+                    "paneId": "%0",
+                    "panePid": 9969,
+                    "paneCurrentCommand": "node",
+                    "paneCurrentPath": str(supervisor_root),
+                    "paneDead": False,
+                    "tail": [],
+                },
+            ):
+                snapshot = health_mirror.collect_loop_health_snapshot(
+                    supervisor_root=supervisor_root,
+                    captured_at="2026-04-14T09:15:00Z",
+                )
+
+        self.assertEqual(snapshot["capturedAt"], "2026-04-14T09:15:00Z")
+        self.assertIsNone(snapshot["supervisor"]["activeIssueNumber"])
+        self.assertIsNone(snapshot["supervisor"]["activeIssue"])
+        self.assertIsNone(snapshot["supervisor"]["turnInProgress"])
+        self.assertIsNone(snapshot["drift"]["issueNumberMatches"])
+        self.assertIsNone(snapshot["drift"]["stateMatches"])
+
     def test_collect_loop_health_snapshot_mirrors_tmux_and_supervisor_state(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             supervisor_root = Path(tempdir)
@@ -127,6 +167,25 @@ class LoopHealthMirrorTests(unittest.TestCase):
                 "stateMatches": True,
             },
         )
+
+    def test_run_tmux_raises_health_mirror_error_on_timeout(self) -> None:
+        with mock.patch(
+            "automationplus.health_mirror.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(
+                cmd=["tmux", "has-session", "-t", "automationplus-loop"],
+                timeout=5,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                health_mirror.HealthMirrorError,
+                r"timed out after 5s: tmux has-session -t automationplus-loop",
+            ):
+                health_mirror._run_tmux(
+                    "has-session",
+                    "-t",
+                    "automationplus-loop",
+                    timeout=5,
+                )
 
 
 if __name__ == "__main__":
