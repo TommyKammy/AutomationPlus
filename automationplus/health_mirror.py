@@ -23,8 +23,7 @@ RECOVERABLE_FAILURE_TOKENS = (
     "temporarily unavailable",
     "connection reset",
     "rate limit",
-    "429",
-    "503",
+    "<retryable-http-status>",
     "connection refused",
 )
 
@@ -73,13 +72,22 @@ def _read_failure_registry(path: Path) -> dict:
     if not isinstance(entries, dict):
         return _empty_failure_registry()
 
+    sanitized_entries = {}
+    for key, value in entries.items():
+        if not (isinstance(key, str) and key and isinstance(value, dict)):
+            continue
+
+        sanitized_entry = dict(value)
+        try:
+            seen_count = int(sanitized_entry.get("seenCount", 0))
+        except (TypeError, ValueError):
+            seen_count = 0
+        sanitized_entry["seenCount"] = max(seen_count, 0)
+        sanitized_entries[key] = sanitized_entry
+
     return {
         "schemaVersion": FAILURE_REGISTRY_SCHEMA_VERSION,
-        "entries": {
-            key: value
-            for key, value in entries.items()
-            if isinstance(key, str) and key and isinstance(value, dict)
-        },
+        "entries": sanitized_entries,
     }
 
 
@@ -89,6 +97,7 @@ def _normalize_failure_text(text: str) -> str:
     normalized = re.sub(r"\bpid=\d+\b", "pid=<pid>", normalized)
     normalized = re.sub(r"\bissue=#?\d+\b", "issue=#<id>", normalized)
     normalized = re.sub(r"\b0x[0-9a-f]+\b", "<hex>", normalized)
+    normalized = re.sub(r"\b(?:429|503)\b", "<retryable-http-status>", normalized)
     normalized = re.sub(r"\b\d+\b", "<n>", normalized)
     normalized = re.sub(r"\s+", " ", normalized)
     return normalized.strip()
@@ -178,7 +187,7 @@ def _merge_failure_registry(
 
     if isinstance(previous, dict):
         first_seen_at = previous.get("firstSeenAt") or captured_at
-        seen_count = int(previous.get("seenCount", 0)) + 1
+        seen_count = max(previous.get("seenCount", 0), 0) + 1
     else:
         first_seen_at = captured_at
         seen_count = 1
