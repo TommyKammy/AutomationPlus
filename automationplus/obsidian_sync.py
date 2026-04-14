@@ -46,7 +46,7 @@ def _service_is_safe(loop_status_payload: dict[str, Any]) -> bool:
         return False
     if not isinstance(failure_policy, dict):
         return False
-    if failure_policy.get("operatorHold") is True:
+    if failure_policy.get("operatorHold") is not False:
         return False
     return failure_policy.get("degradedState") == "healthy"
 

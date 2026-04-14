@@ -107,6 +107,41 @@ class ObsidianGeneratedSyncTests(unittest.TestCase):
             self.assertEqual(quarantine["decision"]["status"], "skipped")
             self.assertEqual(quarantine["serviceState"]["status"], "degraded")
 
+    def test_generated_sync_skips_writes_when_operator_hold_flag_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            workspace = Path(tempdir)
+            output_path = (
+                workspace
+                / ".codex-supervisor"
+                / "generated"
+                / "obsidian"
+                / "notes"
+                / "daily"
+                / "summary.md"
+            )
+
+            artifact = write_generated_note_sync(
+                workspace_root=workspace,
+                vault_root=workspace,
+                output_path=output_path,
+                content="# Daily Summary\n\nGenerated content.\n",
+                loop_status_payload={
+                    "status": "healthy",
+                    "failurePolicy": {
+                        "degradedState": "healthy",
+                    },
+                },
+                generated_at="2026-04-15T10:00:00Z",
+            )
+
+            self.assertEqual(artifact["decision"]["status"], "skipped")
+            self.assertEqual(artifact["decision"]["reasonCode"], "service_not_safe_for_generated_sync")
+            self.assertFalse(output_path.exists())
+            quarantine_path = workspace / ".codex-supervisor" / "generated" / "obsidian" / "quarantine.json"
+            quarantine = json.loads(quarantine_path.read_text(encoding="utf-8"))
+            self.assertEqual(quarantine["decision"]["status"], "skipped")
+            self.assertIsNone(quarantine["serviceState"]["failurePolicy"].get("operatorHold"))
+
 
 if __name__ == "__main__":
     unittest.main()
