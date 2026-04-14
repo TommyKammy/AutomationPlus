@@ -466,6 +466,131 @@ Parallelizable: No
             },
         )
 
+    def test_follow_up_issue_publish_plan_handles_missing_evaluation_payload_without_crashing(
+        self,
+    ) -> None:
+        findings_pack = {
+            "schemaVersion": 1,
+            "artifactType": "post_epic_findings_pack",
+            "generatedAt": "2026-04-14T14:00:00Z",
+            "sourceArtifact": {
+                "artifactType": "post_epic_evaluation",
+                "generatedAt": "2026-04-14T14:00:00Z",
+                "evaluation": None,
+                "target": {
+                    "ref": "refs/heads/main",
+                    "sha": "4444444444444444444444444444444444444444",
+                },
+            },
+            "routing": {
+                "lane": "meta",
+                "sourceClassification": "meta_only",
+                "excludeCurrentPrResiduals": True,
+            },
+            "actionableFindings": [
+                {
+                    "dedupeKey": "child-issue:8:not_completed",
+                    "findingType": "child_issue_follow_up_candidate",
+                    "title": "Child issue requires follow-up after epic close: #8 Build post-Epic follow-up issue publisher",
+                    "severity": "medium",
+                    "confidence": "high",
+                    "novelty": "candidate",
+                    "sourceClassification": "meta_only",
+                    "evidence": {
+                        "issueNumber": 8,
+                        "issueUrl": "https://github.com/TommyKammy/AutomationPlus/issues/8",
+                        "state": "open",
+                        "conclusion": "not_completed",
+                    },
+                }
+            ],
+            "suppressedFindings": {
+                "duplicates": [],
+                "lowValue": [],
+            },
+            "summary": {
+                "actionableFindingCount": 1,
+                "suppressedDuplicateCount": 0,
+                "suppressedLowValueCount": 0,
+            },
+        }
+
+        publish_plan = build_post_epic_follow_up_issue_publish_plan(
+            findings_pack,
+            issue_lint_result={
+                "executionReady": False,
+                "missingRequired": ["summary"],
+                "metadataErrors": [],
+                "highRiskBlockingAmbiguity": None,
+            },
+        )
+
+        self.assertEqual(
+            publish_plan["draftIssue"]["dedupeKey"],
+            "epic-follow-up:target:4444444444444444444444444444444444444444",
+        )
+        self.assertEqual(
+            publish_plan["sourceArtifact"]["evaluation"],
+            {},
+        )
+        self.assertEqual(
+            publish_plan["promotion"],
+            {
+                "decision": "quarantine",
+                "reason": "issue_lint_blocked",
+            },
+        )
+        self.assertEqual(
+            publish_plan["quarantine"],
+            {
+                "reason": "issue_lint_blocked",
+                "blockingDetails": ["issue-lint missing required fields: summary"],
+            },
+        )
+
+    def test_follow_up_issue_publish_plan_does_not_block_on_falsy_ambiguity_markers(
+        self,
+    ) -> None:
+        job = PostEpicEvaluationJob(
+            repository_full_name="TommyKammy/AutomationPlus",
+            epic_issue_number=1,
+            epic_issue_title="Epic: Phase 1 foundations for AutomationPlus loop automation",
+            epic_issue_url="https://github.com/TommyKammy/AutomationPlus/issues/1",
+            evaluation_trigger="epic.completed",
+            target_sha="5555555555555555555555555555555555555555",
+            target_ref="refs/heads/main",
+            child_issues=[
+                EpicChildIssueState(
+                    issue_number=8,
+                    title="Build post-Epic follow-up issue publisher",
+                    state="open",
+                    conclusion="not_completed",
+                    issue_url="https://github.com/TommyKammy/AutomationPlus/issues/8",
+                ),
+            ],
+            generated_at="2026-04-14T14:30:00Z",
+        )
+
+        findings_pack = build_post_epic_findings_pack(evaluate_completed_epic(job))
+        publish_plan = build_post_epic_follow_up_issue_publish_plan(
+            findings_pack,
+            issue_lint_result={
+                "executionReady": True,
+                "missingRequired": [],
+                "metadataErrors": [],
+                "highRiskBlockingAmbiguity": {},
+            },
+        )
+
+        self.assertEqual(
+            publish_plan["promotion"],
+            {
+                "decision": "promote",
+                "reason": "issue_lint_clean",
+            },
+        )
+        self.assertNotIn("quarantine", publish_plan)
+
 
 if __name__ == "__main__":
     unittest.main()

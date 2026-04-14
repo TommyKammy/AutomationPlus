@@ -298,11 +298,22 @@ def build_post_epic_findings_pack(evaluation_artifact: dict[str, Any]) -> dict[s
 
 
 def _follow_up_issue_dedupe_key(findings_pack: dict[str, Any]) -> str:
-    epic = findings_pack.get("sourceArtifact", {}).get("evaluation", {}).get("epic")
+    source_artifact = findings_pack.get("sourceArtifact")
+    if not isinstance(source_artifact, dict):
+        source_artifact = {}
+
+    evaluation = source_artifact.get("evaluation")
+    if not isinstance(evaluation, dict):
+        evaluation = {}
+
+    epic = evaluation.get("epic")
     if isinstance(epic, dict) and epic.get("issueNumber") is not None:
         return f"epic-follow-up:{epic['issueNumber']}"
 
-    target = findings_pack.get("sourceArtifact", {}).get("target", {})
+    target = source_artifact.get("target")
+    if not isinstance(target, dict):
+        target = {}
+
     target_sha = target.get("sha", "unknown")
     return f"epic-follow-up:target:{target_sha}"
 
@@ -345,7 +356,14 @@ def _build_follow_up_draft_issue(
     findings_pack: dict[str, Any],
     source_findings: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    evaluation = findings_pack.get("sourceArtifact", {}).get("evaluation", {})
+    source_artifact = findings_pack.get("sourceArtifact")
+    if not isinstance(source_artifact, dict):
+        source_artifact = {}
+
+    evaluation = source_artifact.get("evaluation")
+    if not isinstance(evaluation, dict):
+        evaluation = {}
+
     epic = evaluation.get("epic", {})
     epic_issue_number = epic.get("issueNumber")
     epic_title = epic.get("title", "Post-epic follow-up")
@@ -391,8 +409,21 @@ def build_post_epic_follow_up_issue_publish_plan(
 ) -> dict[str, Any]:
     source_findings = copy.deepcopy(findings_pack.get("actionableFindings", []))
     routing = copy.deepcopy(findings_pack.get("routing", {}))
-    evaluation = copy.deepcopy(findings_pack.get("sourceArtifact", {}).get("evaluation", {}))
-    epic = evaluation.get("epic", {})
+    source_artifact = findings_pack.get("sourceArtifact")
+    if not isinstance(source_artifact, dict):
+        source_artifact = {}
+
+    evaluation = source_artifact.get("evaluation")
+    if not isinstance(evaluation, dict):
+        evaluation = {}
+    evaluation = copy.deepcopy(evaluation)
+
+    target = source_artifact.get("target")
+    if isinstance(target, dict):
+        target = copy.deepcopy(target)
+    else:
+        target = None
+
     existing_draft_keys = existing_draft_keys or []
     draft_issue = _build_follow_up_draft_issue(findings_pack, source_findings)
     dedupe_key = draft_issue["dedupeKey"]
@@ -418,10 +449,7 @@ def build_post_epic_follow_up_issue_publish_plan(
     else:
         lint_missing_required = bool(issue_lint_result.get("missingRequired"))
         lint_metadata_errors = bool(issue_lint_result.get("metadataErrors"))
-        lint_has_blocking_ambiguity = issue_lint_result.get("highRiskBlockingAmbiguity") not in (
-            None,
-            False,
-        )
+        lint_has_blocking_ambiguity = bool(issue_lint_result.get("highRiskBlockingAmbiguity"))
 
         if (
             not issue_lint_result.get("executionReady", False)
@@ -449,7 +477,7 @@ def build_post_epic_follow_up_issue_publish_plan(
             "artifactType": findings_pack.get("artifactType"),
             "generatedAt": findings_pack.get("generatedAt"),
             "evaluation": evaluation,
-            "target": copy.deepcopy(findings_pack.get("sourceArtifact", {}).get("target")),
+            "target": target,
         },
         "routing": {
             "lane": routing.get("lane", "meta"),
