@@ -1,7 +1,10 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from automationplus.github_ingest import GitHubDeliveryRecord, classify_github_delivery
-from automationplus.registry import AutomationRegistry
+from automationplus.registry import AutomationRegistry, RegistryStateError
 
 
 class GitHubIngestTests(unittest.TestCase):
@@ -120,4 +123,106 @@ class AutomationRegistryTests(unittest.TestCase):
                 "event_name": "issues",
                 "issue_node_id": "I_kwDOExample",
             },
+        )
+
+    def test_registry_persists_duplicates_across_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / ".automationplus" / "registry.json"
+            candidate = GitHubDeliveryRecord(
+                workflow_kind="github.issue.opened",
+                routing_key="github.issue.opened:TommyKammy/AutomationPlus:4",
+                idempotency_key="github:issues:I_kwDOExample:opened",
+                repository_full_name="TommyKammy/AutomationPlus",
+                issue_number=4,
+                installation_id=42,
+                metadata={
+                    "action": "opened",
+                    "delivery_id": "delivery-001",
+                    "event_name": "issues",
+                    "issue_node_id": "I_kwDOExample",
+                },
+            )
+
+            first = AutomationRegistry(state_path=state_path).record(candidate)
+            replay = AutomationRegistry(state_path=state_path).record(
+                GitHubDeliveryRecord(
+                    workflow_kind="github.issue.opened",
+                    routing_key="github.issue.opened:TommyKammy/AutomationPlus:4",
+                    idempotency_key="github:issues:I_kwDOExample:opened",
+                    repository_full_name="TommyKammy/AutomationPlus",
+                    issue_number=4,
+                    installation_id=42,
+                    metadata={
+                        "action": "opened",
+                        "delivery_id": "delivery-002",
+                        "event_name": "issues",
+                        "issue_node_id": "I_kwDOExample",
+                    },
+                )
+            )
+
+        self.assertEqual(first.status, "recorded")
+        self.assertEqual(replay.status, "duplicate")
+        self.assertEqual(replay.record.first_seen_delivery_id, "delivery-001")
+        self.assertEqual(replay.record.last_seen_delivery_id, "delivery-002")
+        self.assertEqual(replay.record.seen_count, 2)
+
+    def test_registry_raises_when_existing_state_file_is_corrupt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / ".automationplus" / "registry.json"
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_text('{"version": ', encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                RegistryStateError,
+                "Registry state file is not valid JSON",
+            ):
+                AutomationRegistry(state_path=state_path)
+
+    def test_registry_raises_when_expected_state_file_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / ".automationplus" / "registry.json"
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+
+            with self.assertRaisesRegex(
+                RegistryStateError,
+                "Registry state file is missing",
+            ):
+                AutomationRegistry(state_path=state_path)
+
+    def test_registry_writes_repo_local_state_on_first_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / ".automationplus" / "registry.json"
+            record = AutomationRegistry(state_path=state_path).record(
+                GitHubDeliveryRecord(
+                    workflow_kind="github.issue.opened",
+                    routing_key="github.issue.opened:TommyKammy/AutomationPlus:4",
+                    idempotency_key="github:issues:I_kwDOExample:opened",
+                    repository_full_name="TommyKammy/AutomationPlus",
+                    issue_number=4,
+                    installation_id=42,
+                    metadata={
+                        "action": "opened",
+                        "delivery_id": "delivery-001",
+                        "event_name": "issues",
+                        "issue_node_id": "I_kwDOExample",
+                    },
+                )
+            )
+
+            on_disk = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(record.status, "recorded")
+        self.assertEqual(on_disk["version"], 1)
+        self.assertEqual(
+            on_disk["records"]["github:issues:I_kwDOExample:opened"]["first_seen_delivery_id"],
+            "delivery-001",
+        )
+        self.assertEqual(
+            on_disk["records"]["github:issues:I_kwDOExample:opened"]["last_seen_delivery_id"],
+            "delivery-001",
+        )
+        self.assertEqual(
+            on_disk["records"]["github:issues:I_kwDOExample:opened"]["seen_count"],
+            1,
         )
