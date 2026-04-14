@@ -5,7 +5,7 @@ import threading
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, ClassVar, Optional
 
 from automationplus.github_ingest import GitHubDeliveryRecord
 
@@ -35,8 +35,8 @@ class RegistryStateError(RuntimeError):
 
 
 class AutomationRegistry:
-    _thread_locks: dict[Path, threading.Lock] = {}
-    _thread_locks_guard = threading.Lock()
+    _thread_locks: ClassVar[dict[Path, threading.Lock]] = {}
+    _thread_locks_guard: ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(self, *, state_path: Optional[Path] = None) -> None:
         self._state_path = Path(state_path).resolve() if state_path is not None else None
