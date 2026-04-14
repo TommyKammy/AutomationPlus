@@ -36,6 +36,12 @@ def _load_config(config_path: Path) -> dict:
             "config_not_found",
             f"Config file not found: {config_path}",
         ) from exc
+    except OSError as exc:
+        raise CsctlError(
+            "config_read_failed",
+            f"Failed reading config file: {config_path}: {exc}",
+            details={"os_error": str(exc)},
+        ) from exc
 
     try:
         data = json.loads(raw)
@@ -70,9 +76,10 @@ def _command_argv(config: dict, command: str) -> List[str]:
 
 
 def _run_backend(argv: Iterable[str]) -> subprocess.CompletedProcess:
+    argv_list = list(argv)
     try:
         return subprocess.run(
-            list(argv),
+            argv_list,
             check=False,
             capture_output=True,
             text=True,
@@ -80,7 +87,13 @@ def _run_backend(argv: Iterable[str]) -> subprocess.CompletedProcess:
     except FileNotFoundError as exc:
         raise CsctlError(
             "backend_not_found",
-            f"Backend executable not found: {list(argv)[0]}",
+            f"Backend executable not found: {argv_list[0]}",
+        ) from exc
+    except OSError as exc:
+        raise CsctlError(
+            "backend_launch_failed",
+            f"Failed to launch backend command: {exc}",
+            details={"os_error": str(exc)},
         ) from exc
 
 
@@ -99,6 +112,16 @@ def _parse_backend_output(result: subprocess.CompletedProcess) -> object:
         ) from exc
 
 
+def _maybe_parse_json(text: str) -> Optional[object]:
+    if not text:
+        return None
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+
 class CsctlError(Exception):
     def __init__(self, code: str, message: str, details: Optional[dict] = None):
         super().__init__(message)
@@ -115,15 +138,20 @@ def _emit(payload: dict) -> int:
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = _build_parser()
-    args, backend_args = parser.parse_known_args(argv)
+    args, extra_args = parser.parse_known_args(argv)
 
     config_path = _resolve_config_path(args.config_path)
 
     try:
+        if extra_args:
+            raise CsctlError(
+                "invalid_arguments",
+                f"Unsupported arguments for {args.command}: {' '.join(extra_args)}",
+                details={"arguments": extra_args},
+            )
         config = _load_config(config_path)
-        backend_argv = _command_argv(config, args.command) + backend_args
+        backend_argv = _command_argv(config, args.command)
         backend_result = _run_backend(backend_argv)
-        backend_payload = _parse_backend_output(backend_result)
     except CsctlError as exc:
         return _emit(
             {
@@ -139,20 +167,30 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
 
     if backend_result.returncode != 0:
+        stderr = backend_result.stderr.strip()
+        stdout = backend_result.stdout.strip()
+        structured_error = _maybe_parse_json(stderr) or _maybe_parse_json(stdout)
+        error_payload = {
+            "code": "backend_failed",
+            "message": "Backend command exited with a non-zero status",
+            "exit_code": backend_result.returncode,
+            "stderr": stderr,
+        }
+        if stdout:
+            error_payload["stdout"] = stdout
+        if structured_error is not None:
+            error_payload["stderr_json"] = structured_error
+
         return _emit(
             {
                 "ok": False,
                 "command": args.command,
                 "config": str(config_path),
-                "error": {
-                    "code": "backend_failed",
-                    "message": "Backend command exited with a non-zero status",
-                    "exit_code": backend_result.returncode,
-                    "stderr": backend_result.stderr.strip(),
-                    "stderr_json": backend_payload,
-                },
+                "error": error_payload,
             }
         )
+
+    backend_payload = _parse_backend_output(backend_result)
 
     return _emit(
         {

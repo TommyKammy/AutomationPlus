@@ -7,6 +7,9 @@ import textwrap
 import unittest
 from pathlib import Path
 from typing import Optional
+from unittest import mock
+
+import automationplus.csctl as csctl
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -31,6 +34,9 @@ class CsctlTests(unittest.TestCase):
                 if command == "fail":
                     print(json.dumps({"error": "backend failed"}))
                     raise SystemExit(3)
+                if command == "fail-no-json":
+                    print("backend exploded", file=sys.stderr)
+                    raise SystemExit(4)
 
                 print(json.dumps({
                     "source_command": command,
@@ -124,6 +130,55 @@ class CsctlTests(unittest.TestCase):
         self.assertEqual(payload["error"]["code"], "backend_failed")
         self.assertEqual(payload["error"]["exit_code"], 3)
         self.assertEqual(payload["error"]["stderr_json"]["error"], "backend failed")
+
+    def test_wrapper_exposes_backend_failure_without_json_output(self) -> None:
+        override = self.workspace / "override-no-json.json"
+        override.write_text(
+            json.dumps(
+                {
+                    "diagnostics": {
+                        "status-json": [sys.executable, str(self.helper), "fail-no-json"]
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.run_csctl("status-json", "--config", str(override))
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["error"]["code"], "backend_failed")
+        self.assertEqual(payload["error"]["exit_code"], 4)
+        self.assertEqual(payload["error"]["stderr"], "backend exploded")
+        self.assertNotIn("stderr_json", payload["error"])
+
+    def test_wrapper_rejects_unknown_passthrough_arguments(self) -> None:
+        result = self.run_csctl("status-json", "--mutating-flag")
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["ok"], False)
+        self.assertEqual(payload["error"]["code"], "invalid_arguments")
+        self.assertEqual(payload["error"]["arguments"], ["--mutating-flag"])
+
+    def test_load_config_wraps_os_errors(self) -> None:
+        with mock.patch.object(Path, "read_text", side_effect=PermissionError("denied")):
+            with self.assertRaises(csctl.CsctlError) as ctx:
+                csctl._load_config(self.workspace / "config.json")
+
+        self.assertEqual(ctx.exception.code, "config_read_failed")
+        self.assertIn("denied", ctx.exception.message)
+        self.assertEqual(ctx.exception.details["os_error"], "denied")
+
+    def test_run_backend_wraps_os_errors(self) -> None:
+        with mock.patch("subprocess.run", side_effect=PermissionError("blocked")):
+            with self.assertRaises(csctl.CsctlError) as ctx:
+                csctl._run_backend(["fake-backend"])
+
+        self.assertEqual(ctx.exception.code, "backend_launch_failed")
+        self.assertIn("blocked", ctx.exception.message)
+        self.assertEqual(ctx.exception.details["os_error"], "blocked")
 
 
 if __name__ == "__main__":
