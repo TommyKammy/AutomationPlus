@@ -1,5 +1,8 @@
+import fcntl
 import json
 import tempfile
+import threading
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -32,51 +35,32 @@ class RegistryStateError(RuntimeError):
 
 
 class AutomationRegistry:
+    _thread_locks: dict[Path, threading.Lock] = {}
+    _thread_locks_guard = threading.Lock()
+
     def __init__(self, *, state_path: Optional[Path] = None) -> None:
         self._state_path = Path(state_path).resolve() if state_path is not None else None
         self._records = self._load_records()
 
     def record(self, candidate: GitHubDeliveryRecord) -> RegistryWriteResult:
-        delivery_id = _delivery_id(candidate)
-        existing = self._records.get(candidate.idempotency_key)
-        if existing is None:
-            record = RegistryRecord(
-                workflow_kind=candidate.workflow_kind,
-                routing_key=candidate.routing_key,
-                idempotency_key=candidate.idempotency_key,
-                repository_full_name=candidate.repository_full_name,
-                issue_number=candidate.issue_number,
-                installation_id=candidate.installation_id,
-                first_seen_delivery_id=delivery_id,
-                last_seen_delivery_id=delivery_id,
-                seen_count=1,
-                metadata=_stable_metadata(candidate.metadata),
-            )
-            self._records[candidate.idempotency_key] = record
-            self._persist_records()
-            return RegistryWriteResult(status="recorded", record=record)
+        if self._state_path is None:
+            self._records, result = _record_records(self._records, candidate)
+            return result
 
-        _assert_same_identity(existing, candidate)
-        record = RegistryRecord(
-            workflow_kind=existing.workflow_kind,
-            routing_key=existing.routing_key,
-            idempotency_key=existing.idempotency_key,
-            repository_full_name=existing.repository_full_name,
-            issue_number=existing.issue_number,
-            installation_id=existing.installation_id,
-            first_seen_delivery_id=existing.first_seen_delivery_id,
-            last_seen_delivery_id=delivery_id,
-            seen_count=existing.seen_count + 1,
-            metadata=existing.metadata,
-        )
-        self._records[candidate.idempotency_key] = record
-        self._persist_records()
-        return RegistryWriteResult(status="duplicate", record=record)
+        allow_missing = not self._state_path.parent.exists()
+        with self._locked_state():
+            records = self._load_records(allow_missing=allow_missing)
+            updated_records, result = _record_records(records, candidate)
+            self._persist_records(updated_records)
+            self._records = updated_records
+            return result
 
-    def _load_records(self) -> dict[str, RegistryRecord]:
+    def _load_records(self, *, allow_missing: bool = False) -> dict[str, RegistryRecord]:
         if self._state_path is None:
             return {}
         if not self._state_path.exists():
+            if allow_missing:
+                return {}
             if self._state_path.parent.exists():
                 raise RegistryStateError(
                     f"Registry state file is missing: {self._state_path}"
@@ -108,7 +92,7 @@ class AutomationRegistry:
             records[key] = _parse_record(key, raw_record)
         return records
 
-    def _persist_records(self) -> None:
+    def _persist_records(self, records: dict[str, RegistryRecord]) -> None:
         if self._state_path is None:
             return
 
@@ -117,7 +101,7 @@ class AutomationRegistry:
             "version": 1,
             "records": {
                 key: asdict(record)
-                for key, record in sorted(self._records.items())
+                for key, record in sorted(records.items())
             },
         }
         with tempfile.NamedTemporaryFile(
@@ -132,12 +116,80 @@ class AutomationRegistry:
 
         temp_path.replace(self._state_path)
 
+    @classmethod
+    def _thread_lock_for(cls, state_path: Path) -> threading.Lock:
+        with cls._thread_locks_guard:
+            thread_lock = cls._thread_locks.get(state_path)
+            if thread_lock is None:
+                thread_lock = threading.Lock()
+                cls._thread_locks[state_path] = thread_lock
+            return thread_lock
+
+    @contextmanager
+    def _locked_state(self) -> Any:
+        if self._state_path is None:
+            yield
+            return
+
+        state_dir = self._state_path.parent
+        lock_path = state_dir / f"{self._state_path.name}.lock"
+        thread_lock = self._thread_lock_for(self._state_path)
+
+        state_dir.mkdir(parents=True, exist_ok=True)
+        with thread_lock:
+            with lock_path.open("a+", encoding="utf-8") as lock_handle:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
 
 def _delivery_id(candidate: GitHubDeliveryRecord) -> str:
     delivery_id = candidate.metadata.get("delivery_id")
     if not isinstance(delivery_id, str) or not delivery_id:
         raise ValueError("GitHub delivery metadata must include a non-empty delivery_id")
     return delivery_id
+
+
+def _record_records(
+    records: dict[str, RegistryRecord],
+    candidate: GitHubDeliveryRecord,
+) -> tuple[dict[str, RegistryRecord], RegistryWriteResult]:
+    delivery_id = _delivery_id(candidate)
+    next_records = dict(records)
+    existing = next_records.get(candidate.idempotency_key)
+    if existing is None:
+        record = RegistryRecord(
+            workflow_kind=candidate.workflow_kind,
+            routing_key=candidate.routing_key,
+            idempotency_key=candidate.idempotency_key,
+            repository_full_name=candidate.repository_full_name,
+            issue_number=candidate.issue_number,
+            installation_id=candidate.installation_id,
+            first_seen_delivery_id=delivery_id,
+            last_seen_delivery_id=delivery_id,
+            seen_count=1,
+            metadata=_stable_metadata(candidate.metadata),
+        )
+        next_records[candidate.idempotency_key] = record
+        return next_records, RegistryWriteResult(status="recorded", record=record)
+
+    _assert_same_identity(existing, candidate)
+    record = RegistryRecord(
+        workflow_kind=existing.workflow_kind,
+        routing_key=existing.routing_key,
+        idempotency_key=existing.idempotency_key,
+        repository_full_name=existing.repository_full_name,
+        issue_number=existing.issue_number,
+        installation_id=existing.installation_id,
+        first_seen_delivery_id=existing.first_seen_delivery_id,
+        last_seen_delivery_id=delivery_id,
+        seen_count=existing.seen_count + 1,
+        metadata=existing.metadata,
+    )
+    next_records[candidate.idempotency_key] = record
+    return next_records, RegistryWriteResult(status="duplicate", record=record)
 
 
 def _stable_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
