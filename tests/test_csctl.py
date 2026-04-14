@@ -22,6 +22,7 @@ class CsctlTests(unittest.TestCase):
         self.workspace = Path(self.tempdir.name)
         self.config_dir = self.workspace / ".codex-supervisor"
         self.config_dir.mkdir(parents=True, exist_ok=True)
+        self.repo_root = REPO_ROOT
 
         self.helper = self.workspace / "fake_diag.py"
         self.helper.write_text(
@@ -58,6 +59,55 @@ class CsctlTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        self.fake_supervisor = self.workspace / "fake_supervisor.py"
+        self.fake_supervisor.write_text(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env python3
+                import sys
+
+                args = sys.argv[1:]
+                if len(args) < 3 or args[-2] != "--config":
+                    print("missing required --config", file=sys.stderr)
+                    raise SystemExit(2)
+
+                command = args[0]
+                command_args = args[1:-2]
+                config_path = args[-1]
+
+                if command == "status":
+                    print("state=reproducing")
+                    print(f"config_path={config_path}")
+                    raise SystemExit(0)
+
+                if command == "doctor":
+                    print("doctor summary without separators")
+                    raise SystemExit(0)
+
+                if command == "explain":
+                    if command_args != ["17"]:
+                        print(f"unexpected explain args: {command_args}", file=sys.stderr)
+                        raise SystemExit(3)
+                    print("issue=#17")
+                    print("runnable=yes")
+                    raise SystemExit(0)
+
+                if command == "issue-lint":
+                    if command_args != ["17"]:
+                        print(f"unexpected issue-lint args: {command_args}", file=sys.stderr)
+                        raise SystemExit(4)
+                    print("execution_ready=yes")
+                    raise SystemExit(0)
+
+                print(f"unexpected command: {command}", file=sys.stderr)
+                raise SystemExit(5)
+                """
+            ),
+            encoding="utf-8",
+        )
+        self.fake_supervisor.chmod(0o755)
+        self.fake_supervisor_config = self.workspace / "fake-supervisor.config.json"
+        self.fake_supervisor_config.write_text("{}", encoding="utf-8")
 
         config = {
             "diagnostics": {
@@ -99,6 +149,39 @@ class CsctlTests(unittest.TestCase):
             text=True,
         )
 
+    def write_bridge_override(self) -> Path:
+        override = self.workspace / "bridge-override.json"
+        override.write_text(
+            json.dumps(
+                {
+                    "diagnostics": {
+                        "status-json": [
+                            sys.executable,
+                            str(self.repo_root / "scripts" / "diagnostics_backend.py"),
+                            "status-json",
+                        ],
+                        "doctor-json": [
+                            sys.executable,
+                            str(self.repo_root / "scripts" / "diagnostics_backend.py"),
+                            "doctor-json",
+                        ],
+                        "explain-json": [
+                            sys.executable,
+                            str(self.repo_root / "scripts" / "diagnostics_backend.py"),
+                            "explain-json",
+                        ],
+                        "issue-lint-json": [
+                            sys.executable,
+                            str(self.repo_root / "scripts" / "diagnostics_backend.py"),
+                            "issue-lint-json",
+                        ],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        return override
+
     def test_status_json_uses_default_config_and_wraps_result(self) -> None:
         result = self.run_csctl("status-json")
 
@@ -121,8 +204,6 @@ class CsctlTests(unittest.TestCase):
         for command in (
             "status-json",
             "doctor-json",
-            "explain-json",
-            "issue-lint-json",
         ):
             with self.subTest(command=command):
                 result = self.run_csctl(command)
@@ -130,6 +211,22 @@ class CsctlTests(unittest.TestCase):
                 payload = json.loads(result.stdout)
                 self.assertEqual(payload["command"], command)
                 self.assertEqual(payload["result"]["source_command"], command)
+
+    def test_issue_scoped_read_only_commands_require_issue_number(self) -> None:
+        for command in ("explain-json", "issue-lint-json"):
+            with self.subTest(command=command):
+                missing = self.run_csctl(command)
+                self.assertEqual(missing.returncode, 1, missing.stderr)
+                missing_payload = json.loads(missing.stdout)
+                self.assertEqual(missing_payload["error"]["code"], "invalid_arguments")
+                self.assertIn("requires one issue number", missing_payload["error"]["message"])
+
+                result = self.run_csctl(command, "17")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                payload = json.loads(result.stdout)
+                self.assertEqual(payload["command"], command)
+                self.assertEqual(payload["result"]["source_command"], command)
+                self.assertEqual(payload["result"]["args"], ["17"])
 
     def test_all_safe_mutation_commands_are_exposed(self) -> None:
         expected_results = {
@@ -241,6 +338,50 @@ class CsctlTests(unittest.TestCase):
         self.assertEqual(payload["error"]["exit_code"], 4)
         self.assertEqual(payload["error"]["stderr"], "backend exploded")
         self.assertNotIn("stderr_json", payload["error"])
+
+    def test_status_json_bridge_invokes_supervisor_status_with_real_backend_shape(self) -> None:
+        override = self.write_bridge_override()
+
+        result = self.run_csctl(
+            "status-json",
+            "--config",
+            str(override),
+            env={
+                "AUTOMATIONPLUS_DIAGNOSTICS_SUPERVISOR_CMD_JSON": json.dumps(
+                    [sys.executable, str(self.fake_supervisor)]
+                ),
+                "AUTOMATIONPLUS_DIAGNOSTICS_SUPERVISOR_CONFIG": str(self.fake_supervisor_config),
+            },
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["command"], "status-json")
+        self.assertEqual(payload["result"]["backend"], "codex-supervisor")
+        self.assertEqual(payload["result"]["supervisor_command"], "status")
+        self.assertEqual(payload["result"]["config_path"], str(self.fake_supervisor_config.resolve()))
+        self.assertEqual(payload["result"]["state"], "reproducing")
+
+    def test_bridge_failures_are_normalized_when_supervisor_output_is_malformed(self) -> None:
+        override = self.write_bridge_override()
+
+        result = self.run_csctl(
+            "doctor-json",
+            "--config",
+            str(override),
+            env={
+                "AUTOMATIONPLUS_DIAGNOSTICS_SUPERVISOR_CMD_JSON": json.dumps(
+                    [sys.executable, str(self.fake_supervisor)]
+                ),
+                "AUTOMATIONPLUS_DIAGNOSTICS_SUPERVISOR_CONFIG": str(self.fake_supervisor_config),
+            },
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["error"]["code"], "backend_failed")
+        self.assertEqual(payload["error"]["stderr_json"]["code"], "invalid_supervisor_output")
+        self.assertEqual(payload["error"]["stderr_json"]["supervisor_command"], "doctor")
 
     def test_wrapper_rejects_unknown_passthrough_arguments(self) -> None:
         result = self.run_csctl("status-json", "--mutating-flag")
