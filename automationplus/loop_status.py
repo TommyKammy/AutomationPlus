@@ -161,6 +161,7 @@ def collect_loop_status(
         "schemaVersion": 1,
         "capturedAt": snapshot.get("capturedAt"),
         "status": top_level_status,
+        "failurePolicy": snapshot.get("failurePolicy"),
         "runtime": {
             "state": loop_runtime.get("state", "unknown"),
             "health": runtime_health,

@@ -42,6 +42,7 @@ Recommended fields:
 The command returns JSON with these top-level sections:
 
 - `status`: one of `healthy`, `degraded`, `off`, or `unknown`
+- `failurePolicy`: classified loop failure state and stable signature metadata for restart/hold decisions
 - `runtime`: live loop runtime details, including session and pane metadata
 - `supervisor`: mirrored supervisor state and decision-cycle context
 - `launcher`: contract metadata, runtime discovery paths, and optional launcher service metadata
@@ -53,5 +54,14 @@ Current status semantics:
 - `degraded`: loop runtime is running but pane is dead or drift checks disagree
 - `off`: loop runtime is explicitly absent
 - `unknown`: runtime could not be observed reliably
+
+`failurePolicy` is intentionally more specific than the top-level `status` value. It classifies the observed loop state into:
+
+- `healthy`: no active loop failure classification
+- `transient-failure`: a recoverable failure signature observed for the first time
+- `repeated-failure`: a recoverable failure signature observed more than once
+- `unsafe-unknown`: an unrecognized or unreliable failure state that requires operator hold
+
+The loop health snapshot artifact also persists a `failureRegistry` keyed by stable signature ids so later restart and stop workflows can consume failure counts and normalized summaries without re-parsing raw tail output.
 
 This contract is intentionally limited to observation so later restart and stop automation can target a stable, explicit boundary without coupling to ad hoc process discovery.
