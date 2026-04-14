@@ -1,0 +1,8 @@
+{
+  "diagnostics": {
+    "status-json": ["python3", "scripts/diagnostics_backend.py", "status-json"],
+    "doctor-json": ["python3", "scripts/diagnostics_backend.py", "doctor-json"],
+    "explain-json": ["python3", "scripts/diagnostics_backend.py", "explain-json"],
+    "issue-lint-json": ["python3", "scripts/diagnostics_backend.py", "issue-lint-json"]
+  }
+}
