@@ -322,11 +322,18 @@ def _render_post_epic_follow_up_issue_body(
     *,
     epic_issue_number: Any,
     epic_title: str,
-    source_findings: list[dict[str, Any]],
+    source_findings: list[Any],
 ) -> str:
     findings_lines = ["## Findings to carry forward"]
     for finding in source_findings:
-        title = str(finding.get("title", "Follow-up finding"))
+        if not isinstance(finding, dict):
+            findings_lines.append("- Follow-up finding (malformed entry)")
+            continue
+
+        raw_title = finding.get("title")
+        title = str(raw_title).strip() if raw_title is not None else ""
+        if not title:
+            title = "Follow-up finding"
         evidence = finding.get("evidence")
         reference = None
         if isinstance(evidence, dict):
