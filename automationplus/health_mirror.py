@@ -1,5 +1,7 @@
 import argparse
+import hashlib
 import json
+import re
 import subprocess
 import tempfile
 from datetime import datetime, timezone
@@ -11,6 +13,20 @@ DEFAULT_CAPTURE_LINES = 20
 DEFAULT_SESSION_NAME = "automationplus-loop"
 DEFAULT_ARTIFACT_RELATIVE_PATH = Path(".codex-supervisor") / "health" / "loop-health.json"
 DEFAULT_TMUX_TIMEOUT_SECONDS = 5.0
+FAILURE_POLICY_SCHEMA_VERSION = 1
+FAILURE_REGISTRY_SCHEMA_VERSION = 1
+RECOVERABLE_FAILURE_TOKENS = (
+    "timed out",
+    "timeout",
+    "econnreset",
+    "eai_again",
+    "temporarily unavailable",
+    "connection reset",
+    "rate limit",
+    "429",
+    "503",
+    "connection refused",
+)
 
 
 class HealthMirrorError(Exception):
@@ -33,6 +49,201 @@ def _read_json_file(path: Path) -> Optional[Any]:
         return json.loads(raw)
     except json.JSONDecodeError:
         return None
+
+
+def _empty_failure_registry() -> dict:
+    return {
+        "schemaVersion": FAILURE_REGISTRY_SCHEMA_VERSION,
+        "entries": {},
+    }
+
+
+def _read_failure_registry(path: Path) -> dict:
+    payload = _read_json_file(path)
+    if not isinstance(payload, dict):
+        return _empty_failure_registry()
+
+    registry = payload.get("failureRegistry")
+    if not isinstance(registry, dict):
+        return _empty_failure_registry()
+    if registry.get("schemaVersion") != FAILURE_REGISTRY_SCHEMA_VERSION:
+        return _empty_failure_registry()
+
+    entries = registry.get("entries")
+    if not isinstance(entries, dict):
+        return _empty_failure_registry()
+
+    return {
+        "schemaVersion": FAILURE_REGISTRY_SCHEMA_VERSION,
+        "entries": {
+            key: value
+            for key, value in entries.items()
+            if isinstance(key, str) and key and isinstance(value, dict)
+        },
+    }
+
+
+def _normalize_failure_text(text: str) -> str:
+    normalized = text.strip().lower()
+    normalized = re.sub(r"\b\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}(?:\.\d+)?z\b", " ", normalized)
+    normalized = re.sub(r"\bpid=\d+\b", "pid=<pid>", normalized)
+    normalized = re.sub(r"\bissue=#?\d+\b", "issue=#<id>", normalized)
+    normalized = re.sub(r"\b0x[0-9a-f]+\b", "<hex>", normalized)
+    normalized = re.sub(r"\b\d+\b", "<n>", normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized.strip()
+
+
+def _last_tail_line(loop_runtime: dict) -> Optional[str]:
+    tail = loop_runtime.get("tail")
+    if not isinstance(tail, list):
+        return None
+    for raw_line in reversed(tail):
+        if isinstance(raw_line, str) and raw_line.strip():
+            return raw_line.strip()
+    return None
+
+
+def _failure_event(loop_runtime: dict, drift: dict) -> Optional[dict]:
+    runtime_state = loop_runtime.get("state")
+    pane_dead = loop_runtime.get("paneDead") is True
+    mismatch_keys = [
+        key
+        for key in ("issueNumberMatches", "workspaceMatches", "stateMatches")
+        if drift.get(key) is False
+    ]
+
+    if runtime_state == "off":
+        return None
+
+    if runtime_state != "running":
+        summary = f"Loop runtime observation is unreliable: state={runtime_state or 'unknown'}"
+        normalized = _normalize_failure_text(summary)
+        return {
+            "reason": "runtime_unobservable",
+            "summary": summary,
+            "normalized": normalized,
+            "signatureClass": "unknown",
+        }
+
+    if pane_dead:
+        last_line = _last_tail_line(loop_runtime)
+        summary = last_line or "Loop pane terminated without captured tail output"
+        normalized = _normalize_failure_text(summary)
+        signature_class = (
+            "transient"
+            if any(token in normalized for token in RECOVERABLE_FAILURE_TOKENS)
+            else "unknown"
+        )
+        return {
+            "reason": "pane_dead",
+            "summary": summary,
+            "normalized": normalized,
+            "signatureClass": signature_class,
+        }
+
+    if mismatch_keys:
+        summary = "Loop runtime drift mismatch: " + ", ".join(mismatch_keys)
+        normalized = _normalize_failure_text(summary)
+        return {
+            "reason": "drift_mismatch",
+            "summary": summary,
+            "normalized": normalized,
+            "signatureClass": "unknown",
+        }
+
+    return None
+
+
+def _signature_id(reason: str, normalized: str) -> str:
+    digest = hashlib.sha256(f"{reason}|{normalized}".encode("utf-8")).hexdigest()
+    return f"sig-{digest[:16]}"
+
+
+def _merge_failure_registry(
+    registry: dict,
+    snapshot: dict,
+) -> dict:
+    event = _failure_event(snapshot.get("loopRuntime", {}), snapshot.get("drift", {}))
+    if event is None:
+        return {
+            "schemaVersion": FAILURE_REGISTRY_SCHEMA_VERSION,
+            "entries": dict(registry.get("entries", {})),
+        }
+
+    captured_at = snapshot.get("capturedAt")
+    next_entries = dict(registry.get("entries", {}))
+    signature_id = _signature_id(event["reason"], event["normalized"])
+    previous = next_entries.get(signature_id)
+
+    if isinstance(previous, dict):
+        first_seen_at = previous.get("firstSeenAt") or captured_at
+        seen_count = int(previous.get("seenCount", 0)) + 1
+    else:
+        first_seen_at = captured_at
+        seen_count = 1
+
+    next_entries[signature_id] = {
+        "id": signature_id,
+        "reason": event["reason"],
+        "signatureClass": event["signatureClass"],
+        "summary": event["summary"],
+        "normalizedSummary": event["normalized"],
+        "firstSeenAt": first_seen_at,
+        "lastSeenAt": captured_at,
+        "seenCount": seen_count,
+    }
+    return {
+        "schemaVersion": FAILURE_REGISTRY_SCHEMA_VERSION,
+        "entries": next_entries,
+    }
+
+
+def _failure_policy(snapshot: dict, registry: dict) -> dict:
+    loop_runtime = snapshot.get("loopRuntime", {})
+    drift = snapshot.get("drift", {})
+    event = _failure_event(loop_runtime, drift)
+    runtime_state = loop_runtime.get("state")
+
+    if event is None:
+        return {
+            "schemaVersion": FAILURE_POLICY_SCHEMA_VERSION,
+            "degradedState": "healthy",
+            "restartEligible": False,
+            "operatorHold": False,
+            "summary": "No loop failure classification is active.",
+            "signature": None,
+        }
+
+    signature_id = _signature_id(event["reason"], event["normalized"])
+    entry = registry.get("entries", {}).get(signature_id, {})
+    seen_count = entry.get("seenCount", 1) if isinstance(entry, dict) else 1
+
+    if event["signatureClass"] == "transient":
+        degraded_state = "transient-failure" if seen_count == 1 else "repeated-failure"
+        restart_eligible = seen_count == 1 and runtime_state == "running"
+        operator_hold = seen_count > 1
+    else:
+        degraded_state = "unsafe-unknown"
+        restart_eligible = False
+        operator_hold = True
+
+    return {
+        "schemaVersion": FAILURE_POLICY_SCHEMA_VERSION,
+        "degradedState": degraded_state,
+        "restartEligible": restart_eligible,
+        "operatorHold": operator_hold,
+        "summary": event["summary"],
+        "signature": {
+            "id": signature_id,
+            "reason": event["reason"],
+            "class": event["signatureClass"],
+            "count": seen_count,
+            "firstSeenAt": entry.get("firstSeenAt") if isinstance(entry, dict) else snapshot.get("capturedAt"),
+            "lastSeenAt": entry.get("lastSeenAt") if isinstance(entry, dict) else snapshot.get("capturedAt"),
+            "normalizedSummary": event["normalized"],
+        },
+    }
 
 
 def _tmux_capture_lines(stdout: str, limit: int) -> List[str]:
@@ -207,6 +418,8 @@ def collect_loop_health_snapshot(
         turn_in_progress,
         decision_cycle,
     )
+    snapshot["failureRegistry"] = _merge_failure_registry(_empty_failure_registry(), snapshot)
+    snapshot["failurePolicy"] = _failure_policy(snapshot, snapshot["failureRegistry"])
     return snapshot
 
 
@@ -223,6 +436,11 @@ def write_loop_health_snapshot(
         capture_lines=capture_lines,
         captured_at=captured_at,
     )
+    snapshot["failureRegistry"] = _merge_failure_registry(
+        _read_failure_registry(Path(output_path)),
+        snapshot,
+    )
+    snapshot["failurePolicy"] = _failure_policy(snapshot, snapshot["failureRegistry"])
 
     output_path = Path(output_path).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
