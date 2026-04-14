@@ -16,7 +16,7 @@ SUPPORTED_COMMANDS = (
     "prune-orphaned-workspaces",
     "reset-corrupt-json-state",
 )
-ISSUE_NUMBER_COMMANDS = {"requeue"}
+ISSUE_NUMBER_COMMANDS = {"requeue", "explain-json", "issue-lint-json"}
 DRY_RUN_COMMANDS = {"run-once"}
 DEFAULT_CONFIG_PATH = Path(".codex-supervisor/config.json")
 
