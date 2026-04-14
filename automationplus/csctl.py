@@ -11,7 +11,13 @@ SUPPORTED_COMMANDS = (
     "doctor-json",
     "explain-json",
     "issue-lint-json",
+    "run-once",
+    "requeue",
+    "prune-orphaned-workspaces",
+    "reset-corrupt-json-state",
 )
+ISSUE_NUMBER_COMMANDS = {"requeue"}
+DRY_RUN_COMMANDS = {"run-once"}
 DEFAULT_CONFIG_PATH = Path(".codex-supervisor/config.json")
 
 
@@ -23,7 +29,9 @@ class _CsctlArgumentParser(argparse.ArgumentParser):
 def _build_parser() -> argparse.ArgumentParser:
     parser = _CsctlArgumentParser(prog="csctl")
     parser.add_argument("command", choices=SUPPORTED_COMMANDS)
+    parser.add_argument("issue_number", nargs="?")
     parser.add_argument("--config", dest="config_path")
+    parser.add_argument("--dry-run", action="store_true")
     return parser
 
 
@@ -78,6 +86,55 @@ def _command_argv(config: dict, command: str) -> List[str]:
             f"Config diagnostics.{command} must be a non-empty string array",
         )
     return argv
+
+
+def _validated_issue_number(command: str, issue_number: Optional[str]) -> Optional[str]:
+    if command in ISSUE_NUMBER_COMMANDS:
+        if issue_number is None:
+            raise CsctlError(
+                "invalid_arguments",
+                f"The {command} command requires one issue number.",
+            )
+        try:
+            parsed = int(issue_number)
+        except ValueError as exc:
+            raise CsctlError(
+                "invalid_arguments",
+                f"Issue number must be a positive integer for {command}.",
+            ) from exc
+        if parsed <= 0:
+            raise CsctlError(
+                "invalid_arguments",
+                f"Issue number must be a positive integer for {command}.",
+            )
+        return str(parsed)
+
+    if issue_number is not None:
+        raise CsctlError(
+            "invalid_arguments",
+            f"Unsupported arguments for {command}: {issue_number}",
+            details={"arguments": [issue_number]},
+        )
+
+    return None
+
+
+def _command_backend_argv(config: dict, args: argparse.Namespace) -> List[str]:
+    backend_argv = list(_command_argv(config, args.command))
+    issue_number = _validated_issue_number(args.command, args.issue_number)
+    if issue_number is not None:
+        backend_argv.append(issue_number)
+
+    if args.dry_run:
+        if args.command not in DRY_RUN_COMMANDS:
+            raise CsctlError(
+                "invalid_arguments",
+                f"Unsupported arguments for {args.command}: --dry-run",
+                details={"arguments": ["--dry-run"]},
+            )
+        backend_argv.append("--dry-run")
+
+    return backend_argv
 
 
 def _run_backend(argv: Iterable[str]) -> subprocess.CompletedProcess:
@@ -143,7 +200,7 @@ def _emit(payload: dict) -> int:
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = _build_parser()
-    args = argparse.Namespace(command=None, config_path=None)
+    args = argparse.Namespace(command=None, issue_number=None, config_path=None, dry_run=False)
     extra_args: List[str] = []
     config_path = _resolve_config_path(None)
 
@@ -157,7 +214,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 details={"arguments": extra_args},
             )
         config = _load_config(config_path)
-        backend_argv = _command_argv(config, args.command)
+        backend_argv = _command_backend_argv(config, args)
         backend_result = _run_backend(backend_argv)
         if backend_result.returncode != 0:
             stderr = backend_result.stderr.strip()

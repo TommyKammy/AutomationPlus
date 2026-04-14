@@ -42,6 +42,13 @@ class CsctlTests(unittest.TestCase):
                     raise SystemExit(0)
                 if command == "empty-success":
                     raise SystemExit(0)
+                if command == "requeue":
+                    print(json.dumps({
+                        "action": "requeue",
+                        "issueNumber": int(sys.argv[2]),
+                        "summary": "Requeued issue.",
+                    }))
+                    raise SystemExit(0)
 
                 print(json.dumps({
                     "source_command": command,
@@ -58,6 +65,18 @@ class CsctlTests(unittest.TestCase):
                 "doctor-json": [sys.executable, str(self.helper), "doctor-json"],
                 "explain-json": [sys.executable, str(self.helper), "explain-json"],
                 "issue-lint-json": [sys.executable, str(self.helper), "issue-lint-json"],
+                "run-once": [sys.executable, str(self.helper), "run-once"],
+                "requeue": [sys.executable, str(self.helper), "requeue"],
+                "prune-orphaned-workspaces": [
+                    sys.executable,
+                    str(self.helper),
+                    "prune-orphaned-workspaces",
+                ],
+                "reset-corrupt-json-state": [
+                    sys.executable,
+                    str(self.helper),
+                    "reset-corrupt-json-state",
+                ],
             }
         }
         (self.config_dir / "config.json").write_text(
@@ -111,6 +130,71 @@ class CsctlTests(unittest.TestCase):
                 payload = json.loads(result.stdout)
                 self.assertEqual(payload["command"], command)
                 self.assertEqual(payload["result"]["source_command"], command)
+
+    def test_all_safe_mutation_commands_are_exposed(self) -> None:
+        expected_results = {
+            "run-once": {
+                "source_command": "run-once",
+                "args": [],
+            },
+            "requeue": {
+                "action": "requeue",
+                "issueNumber": 17,
+                "summary": "Requeued issue.",
+            },
+            "prune-orphaned-workspaces": {
+                "source_command": "prune-orphaned-workspaces",
+                "args": [],
+            },
+            "reset-corrupt-json-state": {
+                "source_command": "reset-corrupt-json-state",
+                "args": [],
+            },
+        }
+
+        for command, expected_result in expected_results.items():
+            with self.subTest(command=command):
+                args = (command, "17") if command == "requeue" else (command,)
+                result = self.run_csctl(*args)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                payload = json.loads(result.stdout)
+                self.assertEqual(payload["command"], command)
+                self.assertEqual(payload["result"], expected_result)
+
+    def test_run_once_accepts_dry_run_without_generic_passthrough(self) -> None:
+        result = self.run_csctl("run-once", "--dry-run")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["command"], "run-once")
+        self.assertEqual(
+            payload["result"],
+            {
+                "source_command": "run-once",
+                "args": ["--dry-run"],
+            },
+        )
+
+    def test_requeue_requires_one_positive_issue_number(self) -> None:
+        missing = self.run_csctl("requeue")
+        self.assertEqual(missing.returncode, 1, missing.stderr)
+        missing_payload = json.loads(missing.stdout)
+        self.assertEqual(missing_payload["error"]["code"], "invalid_arguments")
+        self.assertIn("requires one issue number", missing_payload["error"]["message"])
+
+        invalid = self.run_csctl("requeue", "0")
+        self.assertEqual(invalid.returncode, 1, invalid.stderr)
+        invalid_payload = json.loads(invalid.stdout)
+        self.assertEqual(invalid_payload["error"]["code"], "invalid_arguments")
+        self.assertIn("positive integer", invalid_payload["error"]["message"])
+
+    def test_dry_run_is_refused_for_non_run_once_mutations(self) -> None:
+        result = self.run_csctl("prune-orphaned-workspaces", "--dry-run")
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["error"]["code"], "invalid_arguments")
+        self.assertEqual(payload["error"]["arguments"], ["--dry-run"])
 
     def test_wrapper_exposes_backend_failure_in_normalized_envelope(self) -> None:
         override = self.workspace / "override.json"
