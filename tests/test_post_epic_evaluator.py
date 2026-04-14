@@ -288,6 +288,9 @@ Follow up on remaining post-epic work for #1 Epic: Phase 1 foundations for Autom
 - keep current-PR local-review residual routing excluded from this publish path
 - carry forward actionable meta-only follow-up findings without silent promotion
 
+## Findings to carry forward
+- Child issue requires follow-up after epic close: #8 Build post-Epic follow-up issue publisher (issue #8)
+
 ## Acceptance criteria
 - the generated follow-up issue remains template-clean for codex-supervisor issue-lint
 - the publish plan promotes only when issue-lint is execution-ready and free of blocking ambiguity
@@ -348,6 +351,138 @@ Parallelizable: No
 
         self.assertEqual(persisted, publish_plan)
         self.assertEqual(on_disk, publish_plan)
+
+    def test_follow_up_issue_body_renders_actionable_findings_context(self) -> None:
+        job = PostEpicEvaluationJob(
+            repository_full_name="TommyKammy/AutomationPlus",
+            epic_issue_number=1,
+            epic_issue_title="Epic: Phase 1 foundations for AutomationPlus loop automation",
+            epic_issue_url="https://github.com/TommyKammy/AutomationPlus/issues/1",
+            evaluation_trigger="epic.completed",
+            target_sha="1111111111111111111111111111111111111111",
+            target_ref="refs/heads/main",
+            child_issues=[
+                EpicChildIssueState(
+                    issue_number=8,
+                    title="Build post-Epic follow-up issue publisher",
+                    state="open",
+                    conclusion="not_completed",
+                    issue_url="https://github.com/TommyKammy/AutomationPlus/issues/8",
+                ),
+            ],
+            related_pull_requests=[
+                PullRequestFact(
+                    number=21,
+                    title="Stabilize post-epic publish plan gating",
+                    state="open",
+                    merged=False,
+                    target_branch="main",
+                    merge_commit_sha=None,
+                    pull_request_url="https://github.com/TommyKammy/AutomationPlus/pull/21",
+                    source_issue_numbers=[],
+                ),
+            ],
+            generated_at="2026-04-14T12:15:00Z",
+        )
+
+        findings_pack = build_post_epic_findings_pack(evaluate_completed_epic(job))
+        publish_plan = build_post_epic_follow_up_issue_publish_plan(
+            findings_pack,
+            issue_lint_result={
+                "executionReady": True,
+                "missingRequired": [],
+                "metadataErrors": [],
+                "highRiskBlockingAmbiguity": None,
+            },
+        )
+
+        self.assertIn("## Findings to carry forward", publish_plan["draftIssue"]["body"])
+        self.assertIn(
+            "- Child issue requires follow-up after epic close: #8 Build post-Epic follow-up issue publisher",
+            publish_plan["draftIssue"]["body"],
+        )
+        self.assertIn(
+            "- Related pull request still requires follow-up after epic close: #21 Stabilize post-epic publish plan gating",
+            publish_plan["draftIssue"]["body"],
+        )
+        self.assertIn("## Acceptance criteria", publish_plan["draftIssue"]["body"])
+        self.assertIn("## Verification", publish_plan["draftIssue"]["body"])
+
+    def test_follow_up_issue_body_tolerates_malformed_actionable_findings(self) -> None:
+        findings_pack = {
+            "schemaVersion": 1,
+            "artifactType": "post_epic_findings_pack",
+            "generatedAt": "2026-04-15T00:00:00Z",
+            "sourceArtifact": {
+                "artifactType": "post_epic_evaluation",
+                "generatedAt": "2026-04-15T00:00:00Z",
+                "evaluation": {
+                    "trigger": "epic.completed",
+                    "epic": {
+                        "issueNumber": 1,
+                        "title": "Epic: Phase 1 foundations for AutomationPlus loop automation",
+                        "issueUrl": "https://github.com/TommyKammy/AutomationPlus/issues/1",
+                    },
+                },
+                "target": {
+                    "ref": "refs/heads/main",
+                    "sha": "4444444444444444444444444444444444444444",
+                },
+            },
+            "routing": {
+                "lane": "meta",
+                "sourceClassification": "meta_only",
+                "excludeCurrentPrResiduals": True,
+            },
+            "actionableFindings": [
+                {
+                    "title": "Child issue requires follow-up after epic close: #8 Build post-Epic follow-up issue publisher",
+                    "evidence": {
+                        "issueNumber": 8,
+                        "issueUrl": "https://github.com/TommyKammy/AutomationPlus/issues/8",
+                    },
+                },
+                None,
+                "unexpected",
+                {
+                    "title": "  ",
+                    "evidence": {
+                        "pullRequestNumber": 21,
+                        "pullRequestUrl": "https://github.com/TommyKammy/AutomationPlus/pull/21",
+                    },
+                },
+            ],
+        }
+
+        publish_plan = build_post_epic_follow_up_issue_publish_plan(
+            findings_pack,
+            issue_lint_result={
+                "executionReady": True,
+                "missingRequired": [],
+                "metadataErrors": [],
+                "highRiskBlockingAmbiguity": None,
+            },
+        )
+
+        self.assertIn(
+            "- Child issue requires follow-up after epic close: #8 Build post-Epic follow-up issue publisher (issue #8)",
+            publish_plan["draftIssue"]["body"],
+        )
+        self.assertIn(
+            "- Follow-up finding (malformed entry)",
+            publish_plan["draftIssue"]["body"],
+        )
+        self.assertIn(
+            "- Follow-up finding (PR #21)",
+            publish_plan["draftIssue"]["body"],
+        )
+        self.assertEqual(
+            publish_plan["promotion"],
+            {
+                "decision": "promote",
+                "reason": "issue_lint_clean",
+            },
+        )
 
     def test_follow_up_issue_publish_plan_quarantines_duplicate_or_unsafe_drafts(self) -> None:
         job = PostEpicEvaluationJob(
