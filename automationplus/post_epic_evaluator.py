@@ -322,7 +322,23 @@ def _render_post_epic_follow_up_issue_body(
     *,
     epic_issue_number: Any,
     epic_title: str,
+    source_findings: list[dict[str, Any]],
 ) -> str:
+    findings_lines = ["## Findings to carry forward"]
+    for finding in source_findings:
+        title = str(finding.get("title", "Follow-up finding"))
+        evidence = finding.get("evidence")
+        reference = None
+        if isinstance(evidence, dict):
+            if evidence.get("issueNumber") is not None:
+                reference = f"issue #{evidence['issueNumber']}"
+            elif evidence.get("pullRequestNumber") is not None:
+                reference = f"PR #{evidence['pullRequestNumber']}"
+
+        findings_lines.append(
+            f"- {title}" if reference is None else f"- {title} ({reference})"
+        )
+
     return "\n".join(
         [
             "## Summary",
@@ -332,6 +348,8 @@ def _render_post_epic_follow_up_issue_body(
             "- convert the post-epic findings pack into one execution-ready follow-up issue",
             "- keep current-PR local-review residual routing excluded from this publish path",
             "- carry forward actionable meta-only follow-up findings without silent promotion",
+            "",
+            *findings_lines,
             "",
             "## Acceptance criteria",
             "- the generated follow-up issue remains template-clean for codex-supervisor issue-lint",
@@ -374,6 +392,7 @@ def _build_follow_up_draft_issue(
         "body": _render_post_epic_follow_up_issue_body(
             epic_issue_number=epic_issue_number,
             epic_title=epic_title,
+            source_findings=source_findings,
         ),
         "labels": ["codex", "post-epic-follow-up"],
         "state": "draft",
