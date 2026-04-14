@@ -397,6 +397,75 @@ Parallelizable: No
             },
         )
 
+    def test_follow_up_issue_publish_plan_requires_present_clean_issue_lint_result(
+        self,
+    ) -> None:
+        job = PostEpicEvaluationJob(
+            repository_full_name="TommyKammy/AutomationPlus",
+            epic_issue_number=1,
+            epic_issue_title="Epic: Phase 1 foundations for AutomationPlus loop automation",
+            epic_issue_url="https://github.com/TommyKammy/AutomationPlus/issues/1",
+            evaluation_trigger="epic.completed",
+            target_sha="3333333333333333333333333333333333333333",
+            target_ref="refs/heads/main",
+            child_issues=[
+                EpicChildIssueState(
+                    issue_number=8,
+                    title="Build post-Epic follow-up issue publisher",
+                    state="open",
+                    conclusion="not_completed",
+                    issue_url="https://github.com/TommyKammy/AutomationPlus/issues/8",
+                ),
+            ],
+            generated_at="2026-04-14T13:00:00Z",
+        )
+
+        findings_pack = build_post_epic_findings_pack(evaluate_completed_epic(job))
+
+        missing_lint = build_post_epic_follow_up_issue_publish_plan(findings_pack)
+        self.assertEqual(
+            missing_lint["promotion"],
+            {
+                "decision": "quarantine",
+                "reason": "issue_lint_missing",
+            },
+        )
+        self.assertEqual(
+            missing_lint["quarantine"],
+            {
+                "reason": "issue_lint_missing",
+                "blockingDetails": [
+                    "publish plan requires an issue-lint result before promotion"
+                ],
+            },
+        )
+
+        ambiguous_lint = build_post_epic_follow_up_issue_publish_plan(
+            findings_pack,
+            issue_lint_result={
+                "executionReady": True,
+                "missingRequired": [],
+                "metadataErrors": [],
+                "highRiskBlockingAmbiguity": "assignee resolution is ambiguous",
+            },
+        )
+        self.assertEqual(
+            ambiguous_lint["promotion"],
+            {
+                "decision": "quarantine",
+                "reason": "issue_lint_blocked",
+            },
+        )
+        self.assertEqual(
+            ambiguous_lint["quarantine"],
+            {
+                "reason": "issue_lint_blocked",
+                "blockingDetails": [
+                    "issue-lint blocking ambiguity: assignee resolution is ambiguous"
+                ],
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

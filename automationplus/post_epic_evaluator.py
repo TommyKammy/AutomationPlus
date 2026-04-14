@@ -412,9 +412,28 @@ def build_post_epic_follow_up_issue_publish_plan(
     elif dedupe_key in existing_draft_keys:
         quarantine_reason = "duplicate_draft"
         blocking_details.append(f"draft already exists for dedupe key {dedupe_key}")
-    elif issue_lint_result is not None and not issue_lint_result.get("executionReady", False):
-        quarantine_reason = "issue_lint_blocked"
-        blocking_details.extend(_issue_lint_blocking_details(issue_lint_result))
+    elif issue_lint_result is None:
+        quarantine_reason = "issue_lint_missing"
+        blocking_details.append("publish plan requires an issue-lint result before promotion")
+    else:
+        lint_missing_required = bool(issue_lint_result.get("missingRequired"))
+        lint_metadata_errors = bool(issue_lint_result.get("metadataErrors"))
+        lint_has_blocking_ambiguity = issue_lint_result.get("highRiskBlockingAmbiguity") not in (
+            None,
+            False,
+        )
+
+        if (
+            not issue_lint_result.get("executionReady", False)
+            or lint_has_blocking_ambiguity
+            or lint_missing_required
+            or lint_metadata_errors
+        ):
+            quarantine_reason = "issue_lint_blocked"
+            blocking_details.extend(
+                _issue_lint_blocking_details(issue_lint_result)
+                or ["issue-lint did not mark this draft safe to promote"]
+            )
 
     promotion = (
         {"decision": "quarantine", "reason": quarantine_reason}
