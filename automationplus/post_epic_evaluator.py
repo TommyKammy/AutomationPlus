@@ -1,3 +1,4 @@
+import copy
 import json
 import tempfile
 from dataclasses import dataclass, field
@@ -150,8 +151,8 @@ def _base_finding(
 
 def build_post_epic_findings_pack(evaluation_artifact: dict[str, Any]) -> dict[str, Any]:
     generated_at = evaluation_artifact.get("generatedAt")
-    target = evaluation_artifact.get("target")
-    source_context = evaluation_artifact.get("sourceContext", {})
+    target = copy.deepcopy(evaluation_artifact.get("target"))
+    source_context = copy.deepcopy(evaluation_artifact.get("sourceContext", {}))
     child_issues = source_context.get("childIssues", [])
     related_pull_requests = source_context.get("relatedPullRequests", [])
 

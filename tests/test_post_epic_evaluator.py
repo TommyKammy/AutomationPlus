@@ -205,6 +205,12 @@ class PostEpicEvaluatorTests(unittest.TestCase):
         self.assertEqual(persisted, findings_pack)
         self.assertEqual(on_disk, findings_pack)
 
+        findings_pack["sourceArtifact"]["target"]["sha"] = "mutated"
+        self.assertEqual(
+            evaluation_artifact["target"]["sha"],
+            "def456abc1237890def456abc1237890def456ab",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
