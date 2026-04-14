@@ -157,6 +157,7 @@ class CsctlTests(unittest.TestCase):
                 "explain-json": [sys.executable, str(self.helper), "explain-json"],
                 "issue-lint-json": [sys.executable, str(self.helper), "issue-lint-json"],
                 "loop-status": [sys.executable, str(self.helper), "loop-status"],
+                "restart-decision": [sys.executable, str(self.helper), "restart-decision"],
                 "run-once": [sys.executable, str(self.helper), "run-once"],
                 "requeue": [sys.executable, str(self.helper), "requeue"],
                 "prune-orphaned-workspaces": [
@@ -221,6 +222,11 @@ class CsctlTests(unittest.TestCase):
                             sys.executable,
                             str(self.repo_root / "scripts" / "diagnostics_backend.py"),
                             "loop-status",
+                        ],
+                        "restart-decision": [
+                            sys.executable,
+                            str(self.repo_root / "scripts" / "diagnostics_backend.py"),
+                            "restart-decision",
                         ],
                         "run-once": [
                             sys.executable,
@@ -294,6 +300,7 @@ class CsctlTests(unittest.TestCase):
             "explain-json",
             "issue-lint-json",
             "loop-status",
+            "restart-decision",
         ):
             with self.subTest(command=command):
                 self.assertIn(command, diagnostics)
@@ -305,6 +312,7 @@ class CsctlTests(unittest.TestCase):
             "status-json",
             "doctor-json",
             "loop-status",
+            "restart-decision",
         ):
             with self.subTest(command=command):
                 result = self.run_csctl(command)
@@ -312,6 +320,33 @@ class CsctlTests(unittest.TestCase):
                 payload = json.loads(result.stdout)
                 self.assertEqual(payload["command"], command)
                 self.assertEqual(payload["result"]["source_command"], command)
+
+    def test_restart_decision_bridge_writes_review_artifacts(self) -> None:
+        override = self.write_bridge_override()
+        supervisor_root = self.workspace / "supervisor"
+        workspace_root = self.workspace / "repo"
+        supervisor_root.mkdir(parents=True, exist_ok=True)
+        workspace_root.mkdir(parents=True, exist_ok=True)
+
+        result = self.run_csctl(
+            "restart-decision",
+            "--config",
+            str(override),
+            env={
+                "AUTOMATIONPLUS_LOOP_STATUS_SUPERVISOR_ROOT": str(supervisor_root),
+                "AUTOMATIONPLUS_LOOP_STATUS_WORKSPACE_ROOT": str(workspace_root),
+                "AUTOMATIONPLUS_RESTART_MAX_RESTARTS": "2",
+                "AUTOMATIONPLUS_RESTART_WINDOW_SECONDS": "900",
+            },
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["command"], "restart-decision")
+        self.assertEqual(payload["result"]["artifactType"], "restart_decision")
+        self.assertEqual(payload["result"]["source_command"], "restart-decision")
+        self.assertTrue(Path(payload["result"]["artifactPath"]).is_file())
+        self.assertTrue(Path(payload["result"]["budgetPath"]).is_file())
 
     def test_issue_scoped_read_only_commands_require_issue_number(self) -> None:
         for command in ("explain-json", "issue-lint-json"):

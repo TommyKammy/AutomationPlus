@@ -12,6 +12,7 @@ SUPPORTED_COMMANDS = (
     "explain-json",
     "issue-lint-json",
     "loop-status",
+    "restart-decision",
     "run-once",
     "requeue",
     "prune-orphaned-workspaces",
