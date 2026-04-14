@@ -360,13 +360,14 @@ def _with_supervisor_context(
     argv: List[str],
     config_path: Path,
 ) -> BackendError:
+    details = dict(exc.details)
+    details.setdefault("supervisor_command", supervisor_command)
+    details.setdefault("argv", argv)
+    details.setdefault("config_path", str(config_path))
     return BackendError(
         exc.code,
         exc.message,
-        supervisor_command=supervisor_command,
-        argv=argv,
-        config_path=str(config_path),
-        **exc.details,
+        **details,
     )
 
 
@@ -423,15 +424,17 @@ def main() -> int:
                     argv=argv,
                     config_path=config_path,
                 ) from exc
-            payload = {
+            payload = dict(parsed)
+            payload.update(
+                {
                 "backend": "codex-supervisor",
                 "source_command": command,
                 "supervisor_command": supervisor_command,
                 "issue_number": issue_number,
                 "argv": argv,
                 "config_path": str(config_path),
-                **parsed,
-            }
+                }
+            )
         elif output_mode == "json":
             try:
                 parsed = _parse_json_stdout(
@@ -447,15 +450,17 @@ def main() -> int:
                     argv=argv,
                     config_path=config_path,
                 ) from exc
-            payload = {
+            payload = dict(parsed)
+            payload.update(
+                {
                 "backend": "codex-supervisor",
                 "source_command": command,
                 "supervisor_command": supervisor_command,
                 "issue_number": issue_number,
                 "argv": argv,
                 "config_path": str(config_path),
-                **parsed,
-            }
+                }
+            )
         elif output_mode == "summary_text":
             try:
                 summary = _parse_summary_stdout(stdout=result.stdout)
