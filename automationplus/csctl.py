@@ -11,6 +11,7 @@ SUPPORTED_COMMANDS = (
     "doctor-json",
     "explain-json",
     "issue-lint-json",
+    "loop-status",
     "run-once",
     "requeue",
     "prune-orphaned-workspaces",

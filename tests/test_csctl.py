@@ -156,6 +156,7 @@ class CsctlTests(unittest.TestCase):
                 "doctor-json": [sys.executable, str(self.helper), "doctor-json"],
                 "explain-json": [sys.executable, str(self.helper), "explain-json"],
                 "issue-lint-json": [sys.executable, str(self.helper), "issue-lint-json"],
+                "loop-status": [sys.executable, str(self.helper), "loop-status"],
                 "run-once": [sys.executable, str(self.helper), "run-once"],
                 "requeue": [sys.executable, str(self.helper), "requeue"],
                 "prune-orphaned-workspaces": [
@@ -215,6 +216,11 @@ class CsctlTests(unittest.TestCase):
                             sys.executable,
                             str(self.repo_root / "scripts" / "diagnostics_backend.py"),
                             "issue-lint-json",
+                        ],
+                        "loop-status": [
+                            sys.executable,
+                            str(self.repo_root / "scripts" / "diagnostics_backend.py"),
+                            "loop-status",
                         ],
                         "run-once": [
                             sys.executable,
@@ -277,10 +283,28 @@ class CsctlTests(unittest.TestCase):
                 self.assertIsInstance(diagnostics[command], list)
                 self.assertTrue(diagnostics[command])
 
+    def test_repo_default_config_wires_all_read_only_backends(self) -> None:
+        repo_config = json.loads((REPO_ROOT / ".codex-supervisor" / "config.json").read_text(encoding="utf-8"))
+        diagnostics = repo_config.get("diagnostics")
+
+        self.assertIsInstance(diagnostics, dict)
+        for command in (
+            "status-json",
+            "doctor-json",
+            "explain-json",
+            "issue-lint-json",
+            "loop-status",
+        ):
+            with self.subTest(command=command):
+                self.assertIn(command, diagnostics)
+                self.assertIsInstance(diagnostics[command], list)
+                self.assertTrue(diagnostics[command])
+
     def test_all_read_only_commands_are_exposed(self) -> None:
         for command in (
             "status-json",
             "doctor-json",
+            "loop-status",
         ):
             with self.subTest(command=command):
                 result = self.run_csctl(command)
