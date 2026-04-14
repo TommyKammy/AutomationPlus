@@ -10,10 +10,54 @@ from typing import Dict, List, Optional, Tuple
 
 
 COMMAND_MAP = {
-    "status-json": {"supervisor_command": "status", "needs_issue_number": False},
-    "doctor-json": {"supervisor_command": "doctor", "needs_issue_number": False},
-    "explain-json": {"supervisor_command": "explain", "needs_issue_number": True},
-    "issue-lint-json": {"supervisor_command": "issue-lint", "needs_issue_number": True},
+    "status-json": {
+        "supervisor_command": "status",
+        "needs_issue_number": False,
+        "supports_dry_run": False,
+        "output_mode": "parsed_kv",
+    },
+    "doctor-json": {
+        "supervisor_command": "doctor",
+        "needs_issue_number": False,
+        "supports_dry_run": False,
+        "output_mode": "parsed_kv",
+    },
+    "explain-json": {
+        "supervisor_command": "explain",
+        "needs_issue_number": True,
+        "supports_dry_run": False,
+        "output_mode": "parsed_kv",
+    },
+    "issue-lint-json": {
+        "supervisor_command": "issue-lint",
+        "needs_issue_number": True,
+        "supports_dry_run": False,
+        "output_mode": "parsed_kv",
+    },
+    "run-once": {
+        "supervisor_command": "run-once",
+        "needs_issue_number": False,
+        "supports_dry_run": True,
+        "output_mode": "summary_text",
+    },
+    "requeue": {
+        "supervisor_command": "requeue",
+        "needs_issue_number": True,
+        "supports_dry_run": False,
+        "output_mode": "json",
+    },
+    "prune-orphaned-workspaces": {
+        "supervisor_command": "prune-orphaned-workspaces",
+        "needs_issue_number": False,
+        "supports_dry_run": False,
+        "output_mode": "json",
+    },
+    "reset-corrupt-json-state": {
+        "supervisor_command": "reset-corrupt-json-state",
+        "needs_issue_number": False,
+        "supports_dry_run": False,
+        "output_mode": "json",
+    },
 }
 KEY_PATTERN = re.compile(r"(?<!\S)([A-Za-z0-9_:-]+)=")
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -166,7 +210,11 @@ def _load_supervisor_config() -> Path:
     return config_path
 
 
-def _build_supervisor_argv(command: str, issue_number: Optional[str]) -> Tuple[str, List[str], Path]:
+def _build_supervisor_argv(
+    command: str,
+    issue_number: Optional[str],
+    dry_run: bool,
+) -> Tuple[Dict[str, object], List[str], Path]:
     command_spec = COMMAND_MAP.get(command)
     if command_spec is None:
         raise BackendError("invalid_backend_command", f"Unsupported diagnostics command: {command}")
@@ -186,14 +234,23 @@ def _build_supervisor_argv(command: str, issue_number: Optional[str]) -> Tuple[s
             issue_number=issue_number,
         )
 
+    if dry_run and not command_spec["supports_dry_run"]:
+        raise BackendError(
+            "invalid_backend_arguments",
+            f"The {command} backend command does not accept --dry-run.",
+            command=command,
+        )
+
     supervisor_command = str(command_spec["supervisor_command"])
     supervisor_cmd = _load_supervisor_cmd()
     config_path = _load_supervisor_config()
     argv = [*supervisor_cmd, supervisor_command]
     if issue_number is not None:
         argv.append(issue_number)
+    if dry_run:
+        argv.append("--dry-run")
     argv.extend(["--config", str(config_path)])
-    return supervisor_command, argv, config_path
+    return command_spec, argv, config_path
 
 
 def _run_supervisor(argv: List[str]) -> subprocess.CompletedProcess:
@@ -245,18 +302,107 @@ def _raise_supervisor_failure(
     )
 
 
+def _parse_json_stdout(
+    *,
+    stdout: str,
+    supervisor_command: str,
+    argv: List[str],
+    config_path: Path,
+) -> Dict[str, object]:
+    stripped = stdout.strip()
+    if not stripped:
+        raise BackendError(
+            "invalid_supervisor_output",
+            "Supervisor produced empty stdout.",
+            supervisor_command=supervisor_command,
+            argv=argv,
+            config_path=str(config_path),
+        )
+
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError as exc:
+        raise BackendError(
+            "invalid_supervisor_output",
+            "Supervisor stdout is not valid JSON.",
+            supervisor_command=supervisor_command,
+            argv=argv,
+            config_path=str(config_path),
+            stdout=stripped,
+        ) from exc
+
+    if not isinstance(parsed, dict):
+        raise BackendError(
+            "invalid_supervisor_output",
+            "Supervisor stdout JSON must be an object.",
+            supervisor_command=supervisor_command,
+            argv=argv,
+            config_path=str(config_path),
+            stdout=stripped,
+        )
+    return parsed
+
+
+def _parse_summary_stdout(
+    *,
+    stdout: str,
+) -> str:
+    stripped = stdout.strip()
+    if not stripped:
+        raise BackendError("invalid_supervisor_output", "Supervisor produced empty stdout.")
+    return stripped
+
+
+def _with_supervisor_context(
+    exc: BackendError,
+    *,
+    supervisor_command: str,
+    argv: List[str],
+    config_path: Path,
+) -> BackendError:
+    return BackendError(
+        exc.code,
+        exc.message,
+        supervisor_command=supervisor_command,
+        argv=argv,
+        config_path=str(config_path),
+        **exc.details,
+    )
+
+
 def main() -> int:
     try:
         argc = len(sys.argv)
-        if argc not in (2, 3):
+        if argc < 2 or argc > 4:
             raise BackendError(
                 "invalid_backend_arguments",
-                "usage: diagnostics_backend.py <command> [issue-number]",
+                "usage: diagnostics_backend.py <command> [issue-number] [--dry-run]",
             )
 
         command = sys.argv[1]
-        issue_number = sys.argv[2] if argc == 3 else None
-        supervisor_command, argv, config_path = _build_supervisor_argv(command, issue_number)
+        issue_number: Optional[str] = None
+        dry_run = False
+        for arg in sys.argv[2:]:
+            if arg == "--dry-run":
+                if dry_run:
+                    raise BackendError(
+                        "invalid_backend_arguments",
+                        "Duplicate --dry-run flag.",
+                        command=command,
+                    )
+                dry_run = True
+                continue
+            if issue_number is None:
+                issue_number = arg
+                continue
+            raise BackendError(
+                "invalid_backend_arguments",
+                "Too many backend arguments.",
+                command=command,
+            )
+
+        command_spec, argv, config_path = _build_supervisor_argv(command, issue_number, dry_run)
+        supervisor_command = str(command_spec["supervisor_command"])
         result = _run_supervisor(argv)
         if result.returncode != 0:
             _raise_supervisor_failure(
@@ -266,26 +412,76 @@ def main() -> int:
                 result=result,
             )
 
-        try:
-            parsed = _parse_supervisor_stdout(result.stdout)
-        except BackendError as exc:
+        output_mode = str(command_spec["output_mode"])
+        if output_mode == "parsed_kv":
+            try:
+                parsed = _parse_supervisor_stdout(result.stdout)
+            except BackendError as exc:
+                raise _with_supervisor_context(
+                    exc,
+                    supervisor_command=supervisor_command,
+                    argv=argv,
+                    config_path=config_path,
+                ) from exc
+            payload = {
+                "backend": "codex-supervisor",
+                "source_command": command,
+                "supervisor_command": supervisor_command,
+                "issue_number": issue_number,
+                "argv": argv,
+                "config_path": str(config_path),
+                **parsed,
+            }
+        elif output_mode == "json":
+            try:
+                parsed = _parse_json_stdout(
+                    stdout=result.stdout,
+                    supervisor_command=supervisor_command,
+                    argv=argv,
+                    config_path=config_path,
+                )
+            except BackendError as exc:
+                raise _with_supervisor_context(
+                    exc,
+                    supervisor_command=supervisor_command,
+                    argv=argv,
+                    config_path=config_path,
+                ) from exc
+            payload = {
+                "backend": "codex-supervisor",
+                "source_command": command,
+                "supervisor_command": supervisor_command,
+                "issue_number": issue_number,
+                "argv": argv,
+                "config_path": str(config_path),
+                **parsed,
+            }
+        elif output_mode == "summary_text":
+            try:
+                summary = _parse_summary_stdout(stdout=result.stdout)
+            except BackendError as exc:
+                raise _with_supervisor_context(
+                    exc,
+                    supervisor_command=supervisor_command,
+                    argv=argv,
+                    config_path=config_path,
+                ) from exc
+            payload = {
+                "backend": "codex-supervisor",
+                "source_command": command,
+                "supervisor_command": supervisor_command,
+                "issue_number": issue_number,
+                "argv": argv,
+                "config_path": str(config_path),
+                "dry_run": dry_run,
+                "summary": summary,
+            }
+        else:
             raise BackendError(
-                exc.code,
-                exc.message,
-                supervisor_command=supervisor_command,
-                argv=argv,
-                config_path=str(config_path),
-                **exc.details,
-            ) from exc
-        payload = {
-            "backend": "codex-supervisor",
-            "source_command": command,
-            "supervisor_command": supervisor_command,
-            "issue_number": issue_number,
-            "argv": argv,
-            "config_path": str(config_path),
-            **parsed,
-        }
+                "invalid_backend_config",
+                f"Unsupported output mode configured for {command}: {output_mode}",
+                command=command,
+            )
         return _emit(payload, stream=sys.stdout)
     except BackendError as exc:
         return _emit(

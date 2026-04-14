@@ -99,6 +99,35 @@ class CsctlTests(unittest.TestCase):
                     print("execution_ready=yes")
                     raise SystemExit(0)
 
+                if command == "run-once":
+                    if command_args not in ([], ["--dry-run"]):
+                        print(f"unexpected run-once args: {command_args}", file=sys.stderr)
+                        raise SystemExit(6)
+                    suffix = " (dry-run)" if command_args == ["--dry-run"] else ""
+                    print(f"run-once complete{suffix}")
+                    raise SystemExit(0)
+
+                if command == "requeue":
+                    if command_args != ["17"]:
+                        print(f"unexpected requeue args: {command_args}", file=sys.stderr)
+                        raise SystemExit(7)
+                    print('{"action":"requeue","issueNumber":17,"summary":"Requeued issue #17.","outcome":"mutated"}')
+                    raise SystemExit(0)
+
+                if command == "prune-orphaned-workspaces":
+                    if command_args:
+                        print(f"unexpected prune args: {command_args}", file=sys.stderr)
+                        raise SystemExit(8)
+                    print('{"action":"prune-orphaned-workspaces","outcome":"completed","summary":"Pruned 0 orphaned workspaces.","pruned":[],"skipped":[]}')
+                    raise SystemExit(0)
+
+                if command == "reset-corrupt-json-state":
+                    if command_args:
+                        print(f"unexpected reset args: {command_args}", file=sys.stderr)
+                        raise SystemExit(9)
+                    print('{"action":"reset-corrupt-json-state","outcome":"completed","summary":"No corrupt JSON state files were present.","reset":[]}')
+                    raise SystemExit(0)
+
                 print(f"unexpected command: {command}", file=sys.stderr)
                 raise SystemExit(5)
                 """
@@ -175,6 +204,26 @@ class CsctlTests(unittest.TestCase):
                             str(self.repo_root / "scripts" / "diagnostics_backend.py"),
                             "issue-lint-json",
                         ],
+                        "run-once": [
+                            sys.executable,
+                            str(self.repo_root / "scripts" / "diagnostics_backend.py"),
+                            "run-once",
+                        ],
+                        "requeue": [
+                            sys.executable,
+                            str(self.repo_root / "scripts" / "diagnostics_backend.py"),
+                            "requeue",
+                        ],
+                        "prune-orphaned-workspaces": [
+                            sys.executable,
+                            str(self.repo_root / "scripts" / "diagnostics_backend.py"),
+                            "prune-orphaned-workspaces",
+                        ],
+                        "reset-corrupt-json-state": [
+                            sys.executable,
+                            str(self.repo_root / "scripts" / "diagnostics_backend.py"),
+                            "reset-corrupt-json-state",
+                        ],
                     }
                 }
             ),
@@ -199,6 +248,22 @@ class CsctlTests(unittest.TestCase):
                 },
             },
         )
+
+    def test_repo_default_config_wires_all_safe_mutation_backends(self) -> None:
+        repo_config = json.loads((REPO_ROOT / ".codex-supervisor" / "config.json").read_text(encoding="utf-8"))
+        diagnostics = repo_config.get("diagnostics")
+
+        self.assertIsInstance(diagnostics, dict)
+        for command in (
+            "run-once",
+            "requeue",
+            "prune-orphaned-workspaces",
+            "reset-corrupt-json-state",
+        ):
+            with self.subTest(command=command):
+                self.assertIn(command, diagnostics)
+                self.assertIsInstance(diagnostics[command], list)
+                self.assertTrue(diagnostics[command])
 
     def test_all_read_only_commands_are_exposed(self) -> None:
         for command in (
@@ -382,6 +447,42 @@ class CsctlTests(unittest.TestCase):
         self.assertEqual(payload["error"]["code"], "backend_failed")
         self.assertEqual(payload["error"]["stderr_json"]["code"], "invalid_supervisor_output")
         self.assertEqual(payload["error"]["stderr_json"]["supervisor_command"], "doctor")
+
+    def test_mutation_bridge_normalizes_safe_supervisor_commands(self) -> None:
+        override = self.write_bridge_override()
+        env = {
+            "AUTOMATIONPLUS_DIAGNOSTICS_SUPERVISOR_CMD_JSON": json.dumps(
+                [sys.executable, str(self.fake_supervisor)]
+            ),
+            "AUTOMATIONPLUS_DIAGNOSTICS_SUPERVISOR_CONFIG": str(self.fake_supervisor_config),
+        }
+
+        cases = (
+            ("run-once", (), {"summary": "run-once complete", "dry_run": False}),
+            ("run-once", ("--dry-run",), {"summary": "run-once complete (dry-run)", "dry_run": True}),
+            ("requeue", ("17",), {"action": "requeue", "issueNumber": 17, "outcome": "mutated"}),
+            (
+                "prune-orphaned-workspaces",
+                (),
+                {"action": "prune-orphaned-workspaces", "outcome": "completed"},
+            ),
+            (
+                "reset-corrupt-json-state",
+                (),
+                {"action": "reset-corrupt-json-state", "outcome": "completed"},
+            ),
+        )
+
+        for command, extra_args, expected in cases:
+            with self.subTest(command=command, extra_args=extra_args):
+                result = self.run_csctl(command, *extra_args, "--config", str(override), env=env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                payload = json.loads(result.stdout)
+                self.assertEqual(payload["command"], command)
+                self.assertEqual(payload["result"]["backend"], "codex-supervisor")
+                self.assertEqual(payload["result"]["source_command"], command)
+                for key, value in expected.items():
+                    self.assertEqual(payload["result"][key], value)
 
     def test_wrapper_rejects_unknown_passthrough_arguments(self) -> None:
         result = self.run_csctl("status-json", "--mutating-flag")

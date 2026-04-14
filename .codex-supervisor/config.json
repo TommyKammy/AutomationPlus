@@ -3,6 +3,10 @@
     "status-json": ["python3", "scripts/diagnostics_backend.py", "status-json"],
     "doctor-json": ["python3", "scripts/diagnostics_backend.py", "doctor-json"],
     "explain-json": ["python3", "scripts/diagnostics_backend.py", "explain-json"],
-    "issue-lint-json": ["python3", "scripts/diagnostics_backend.py", "issue-lint-json"]
+    "issue-lint-json": ["python3", "scripts/diagnostics_backend.py", "issue-lint-json"],
+    "run-once": ["python3", "scripts/diagnostics_backend.py", "run-once"],
+    "requeue": ["python3", "scripts/diagnostics_backend.py", "requeue"],
+    "prune-orphaned-workspaces": ["python3", "scripts/diagnostics_backend.py", "prune-orphaned-workspaces"],
+    "reset-corrupt-json-state": ["python3", "scripts/diagnostics_backend.py", "reset-corrupt-json-state"]
   }
 }
