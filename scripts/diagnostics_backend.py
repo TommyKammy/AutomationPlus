@@ -8,7 +8,6 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-
 COMMAND_MAP = {
     "status-json": {
         "supervisor_command": "status",
@@ -33,6 +32,12 @@ COMMAND_MAP = {
         "needs_issue_number": True,
         "supports_dry_run": False,
         "output_mode": "parsed_kv",
+    },
+    "loop-status": {
+        "supervisor_command": None,
+        "needs_issue_number": False,
+        "supports_dry_run": False,
+        "output_mode": "loop_status",
     },
     "run-once": {
         "supervisor_command": "run-once",
@@ -61,9 +66,15 @@ COMMAND_MAP = {
 }
 KEY_PATTERN = re.compile(r"(?<!\S)([A-Za-z0-9_:-]+)=")
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from automationplus import loop_status
+
 DEFAULT_SUPERVISOR_ROOT = REPO_ROOT.parent.parent / "AutomationPlus-codex-supervisor"
 DEFAULT_SUPERVISOR_CMD = ["node", str(DEFAULT_SUPERVISOR_ROOT / "dist" / "index.js")]
 DEFAULT_SUPERVISOR_CONFIG = DEFAULT_SUPERVISOR_ROOT / "supervisor.config.coderabbit.json"
+DEFAULT_LOOP_STATUS_WORKSPACE_ROOT = REPO_ROOT
 
 
 class BackendError(Exception):
@@ -253,6 +264,36 @@ def _build_supervisor_argv(
     return command_spec, argv, config_path
 
 
+def _load_loop_status_supervisor_root() -> Path:
+    raw = os.environ.get("AUTOMATIONPLUS_LOOP_STATUS_SUPERVISOR_ROOT")
+    return Path(raw).expanduser().resolve() if raw else DEFAULT_SUPERVISOR_ROOT.resolve()
+
+
+def _load_loop_status_workspace_root() -> Path:
+    raw = os.environ.get("AUTOMATIONPLUS_LOOP_STATUS_WORKSPACE_ROOT")
+    return Path(raw).expanduser().resolve() if raw else DEFAULT_LOOP_STATUS_WORKSPACE_ROOT.resolve()
+
+
+def _load_loop_status_session_name() -> str:
+    return os.environ.get("AUTOMATIONPLUS_LOOP_STATUS_SESSION_NAME", loop_status.DEFAULT_SESSION_NAME)
+
+
+def _load_loop_status_capture_lines() -> int:
+    raw = os.environ.get("AUTOMATIONPLUS_LOOP_STATUS_CAPTURE_LINES")
+    if raw is None:
+        return loop_status.DEFAULT_CAPTURE_LINES
+
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise BackendError(
+            "invalid_backend_config",
+            "AUTOMATIONPLUS_LOOP_STATUS_CAPTURE_LINES must be an integer.",
+            env_var="AUTOMATIONPLUS_LOOP_STATUS_CAPTURE_LINES",
+        ) from exc
+    return value
+
+
 def _run_supervisor(argv: List[str]) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(
@@ -402,6 +443,44 @@ def main() -> int:
                 command=command,
             )
 
+        command_spec = COMMAND_MAP.get(command)
+        if command_spec is None:
+            raise BackendError("invalid_backend_command", f"Unsupported diagnostics command: {command}")
+
+        output_mode = str(command_spec["output_mode"])
+        if output_mode == "loop_status":
+            if issue_number is not None:
+                raise BackendError(
+                    "invalid_backend_arguments",
+                    f"The {command} backend command does not accept an issue number.",
+                    command=command,
+                    issue_number=issue_number,
+                )
+            if dry_run:
+                raise BackendError(
+                    "invalid_backend_arguments",
+                    f"The {command} backend command does not accept --dry-run.",
+                    command=command,
+                )
+
+            payload = loop_status.collect_loop_status(
+                supervisor_root=_load_loop_status_supervisor_root(),
+                workspace_root=_load_loop_status_workspace_root(),
+                session_name=_load_loop_status_session_name(),
+                capture_lines=_load_loop_status_capture_lines(),
+            )
+            payload.update(
+                {
+                    "backend": "automationplus",
+                    "source_command": command,
+                    "supervisor_command": None,
+                    "issue_number": None,
+                    "argv": [command],
+                    "config_path": None,
+                }
+            )
+            return _emit(payload, stream=sys.stdout)
+
         command_spec, argv, config_path = _build_supervisor_argv(command, issue_number, dry_run)
         supervisor_command = str(command_spec["supervisor_command"])
         result = _run_supervisor(argv)
@@ -413,7 +492,6 @@ def main() -> int:
                 result=result,
             )
 
-        output_mode = str(command_spec["output_mode"])
         if output_mode == "parsed_kv":
             try:
                 parsed = _parse_supervisor_stdout(result.stdout)
