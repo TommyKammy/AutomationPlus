@@ -15,8 +15,13 @@ SUPPORTED_COMMANDS = (
 DEFAULT_CONFIG_PATH = Path(".codex-supervisor/config.json")
 
 
+class _CsctlArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise CsctlError("invalid_arguments", message)
+
+
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="csctl")
+    parser = _CsctlArgumentParser(prog="csctl")
     parser.add_argument("command", choices=SUPPORTED_COMMANDS)
     parser.add_argument("--config", dest="config_path")
     return parser
@@ -138,11 +143,13 @@ def _emit(payload: dict) -> int:
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = _build_parser()
-    args, extra_args = parser.parse_known_args(argv)
-
-    config_path = _resolve_config_path(args.config_path)
+    args = argparse.Namespace(command=None, config_path=None)
+    extra_args: List[str] = []
+    config_path = _resolve_config_path(None)
 
     try:
+        args, extra_args = parser.parse_known_args(argv, namespace=args)
+        config_path = _resolve_config_path(args.config_path)
         if extra_args:
             raise CsctlError(
                 "invalid_arguments",
@@ -152,6 +159,30 @@ def main(argv: Optional[List[str]] = None) -> int:
         config = _load_config(config_path)
         backend_argv = _command_argv(config, args.command)
         backend_result = _run_backend(backend_argv)
+        if backend_result.returncode != 0:
+            stderr = backend_result.stderr.strip()
+            stdout = backend_result.stdout.strip()
+            structured_error = _maybe_parse_json(stderr) or _maybe_parse_json(stdout)
+            error_payload = {
+                "code": "backend_failed",
+                "message": "Backend command exited with a non-zero status",
+                "exit_code": backend_result.returncode,
+                "stderr": stderr,
+            }
+            if stdout:
+                error_payload["stdout"] = stdout
+            if structured_error is not None:
+                error_payload["stderr_json"] = structured_error
+
+            return _emit(
+                {
+                    "ok": False,
+                    "command": args.command,
+                    "config": str(config_path),
+                    "error": error_payload,
+                }
+            )
+        backend_payload = _parse_backend_output(backend_result)
     except CsctlError as exc:
         return _emit(
             {
@@ -165,32 +196,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                 },
             }
         )
-
-    if backend_result.returncode != 0:
-        stderr = backend_result.stderr.strip()
-        stdout = backend_result.stdout.strip()
-        structured_error = _maybe_parse_json(stderr) or _maybe_parse_json(stdout)
-        error_payload = {
-            "code": "backend_failed",
-            "message": "Backend command exited with a non-zero status",
-            "exit_code": backend_result.returncode,
-            "stderr": stderr,
-        }
-        if stdout:
-            error_payload["stdout"] = stdout
-        if structured_error is not None:
-            error_payload["stderr_json"] = structured_error
-
-        return _emit(
-            {
-                "ok": False,
-                "command": args.command,
-                "config": str(config_path),
-                "error": error_payload,
-            }
-        )
-
-    backend_payload = _parse_backend_output(backend_result)
 
     return _emit(
         {

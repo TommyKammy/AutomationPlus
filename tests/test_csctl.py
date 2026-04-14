@@ -37,6 +37,11 @@ class CsctlTests(unittest.TestCase):
                 if command == "fail-no-json":
                     print("backend exploded", file=sys.stderr)
                     raise SystemExit(4)
+                if command == "invalid-json-success":
+                    print("not valid json")
+                    raise SystemExit(0)
+                if command == "empty-success":
+                    raise SystemExit(0)
 
                 print(json.dumps({
                     "source_command": command,
@@ -161,6 +166,80 @@ class CsctlTests(unittest.TestCase):
         self.assertEqual(payload["ok"], False)
         self.assertEqual(payload["error"]["code"], "invalid_arguments")
         self.assertEqual(payload["error"]["arguments"], ["--mutating-flag"])
+
+    def test_wrapper_normalizes_missing_command(self) -> None:
+        result = self.run_csctl()
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["ok"], False)
+        self.assertIsNone(payload["command"])
+        self.assertEqual(payload["error"]["code"], "invalid_arguments")
+        self.assertIn("required", payload["error"]["message"])
+
+    def test_wrapper_normalizes_invalid_command_choice(self) -> None:
+        result = self.run_csctl("mutate-json")
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["ok"], False)
+        self.assertIsNone(payload["command"])
+        self.assertEqual(payload["error"]["code"], "invalid_arguments")
+        self.assertIn("invalid choice", payload["error"]["message"])
+
+    def test_wrapper_normalizes_missing_config_value(self) -> None:
+        result = self.run_csctl("status-json", "--config")
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["ok"], False)
+        self.assertEqual(payload["command"], "status-json")
+        self.assertEqual(payload["error"]["code"], "invalid_arguments")
+        self.assertIn("expected one argument", payload["error"]["message"])
+
+    def test_wrapper_normalizes_invalid_backend_json(self) -> None:
+        override = self.workspace / "override-invalid-json.json"
+        override.write_text(
+            json.dumps(
+                {
+                    "diagnostics": {
+                        "status-json": [sys.executable, str(self.helper), "invalid-json-success"]
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.run_csctl("status-json", "--config", str(override))
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["ok"], False)
+        self.assertEqual(payload["command"], "status-json")
+        self.assertEqual(payload["error"]["code"], "invalid_backend_output")
+        self.assertEqual(payload["error"]["stdout"], "not valid json")
+
+    def test_wrapper_normalizes_empty_backend_stdout(self) -> None:
+        override = self.workspace / "override-empty.json"
+        override.write_text(
+            json.dumps(
+                {
+                    "diagnostics": {
+                        "status-json": [sys.executable, str(self.helper), "empty-success"]
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.run_csctl("status-json", "--config", str(override))
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["ok"], False)
+        self.assertEqual(payload["command"], "status-json")
+        self.assertEqual(payload["error"]["code"], "invalid_backend_output")
+        self.assertIn("empty stdout", payload["error"]["message"])
 
     def test_load_config_wraps_os_errors(self) -> None:
         with mock.patch.object(Path, "read_text", side_effect=PermissionError("denied")):
