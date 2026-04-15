@@ -634,6 +634,9 @@ def build_roadmap_proposal_pack(
     *,
     proposals: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    if not isinstance(proposals, list):
+        raise ValueError("proposals must be a list of proposal objects")
+
     source_artifact = findings_pack.get("sourceArtifact")
     if not isinstance(source_artifact, dict):
         source_artifact = {}

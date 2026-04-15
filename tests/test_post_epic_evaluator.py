@@ -885,6 +885,38 @@ Parallelizable: No
                 ],
             )
 
+    def test_roadmap_proposal_pack_rejects_non_list_proposals_payload(self) -> None:
+        job = PostEpicEvaluationJob(
+            repository_full_name="TommyKammy/AutomationPlus",
+            epic_issue_number=1,
+            epic_issue_title="Epic: Phase 1 foundations for AutomationPlus loop automation",
+            epic_issue_url="https://github.com/TommyKammy/AutomationPlus/issues/1",
+            evaluation_trigger="epic.completed",
+            target_sha="8888888888888888888888888888888888888888",
+            target_ref="refs/heads/main",
+            child_issues=[
+                EpicChildIssueState(
+                    issue_number=8,
+                    title="Build post-Epic follow-up issue publisher",
+                    state="open",
+                    conclusion="not_completed",
+                    issue_url="https://github.com/TommyKammy/AutomationPlus/issues/8",
+                ),
+            ],
+            generated_at="2026-04-15T02:30:00Z",
+        )
+
+        findings_pack = build_post_epic_findings_pack(evaluate_completed_epic(job))
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "proposals must be a list of proposal objects",
+        ):
+            build_roadmap_proposal_pack(  # type: ignore[arg-type]
+                findings_pack,
+                proposals=None,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
