@@ -10,6 +10,7 @@ from automationplus.post_epic_evaluator import (
     build_post_epic_findings_pack,
     build_post_epic_follow_up_issue_publish_plan,
     build_planning_pack,
+    build_roadmap_continuity_issue_set_publish_plan,
     build_roadmap_proposal_pack,
     evaluate_completed_epic,
     write_post_epic_findings_pack,
@@ -1465,6 +1466,253 @@ Parallelizable: No
                     },
                 ],
             )
+
+    def test_planning_pack_can_publish_bounded_roadmap_continuity_issue_set(self) -> None:
+        job = PostEpicEvaluationJob(
+            repository_full_name="TommyKammy/AutomationPlus",
+            epic_issue_number=1,
+            epic_issue_title="Epic: Phase 1 foundations for AutomationPlus loop automation",
+            epic_issue_url="https://github.com/TommyKammy/AutomationPlus/issues/1",
+            evaluation_trigger="epic.completed",
+            target_sha="cccccccccccccccccccccccccccccccccccccccc",
+            target_ref="refs/heads/main",
+            child_issues=[],
+            generated_at="2026-04-15T04:00:00Z",
+        )
+
+        findings_pack = build_post_epic_findings_pack(evaluate_completed_epic(job))
+        proposal_pack = build_roadmap_proposal_pack(
+            findings_pack,
+            proposals=[
+                {
+                    "proposalKey": "phase-2-planning",
+                    "title": "Phase 2 planning pack generation",
+                    "summary": "Turn approved roadmap proposals into execution-ready planning artifacts.",
+                    "goals": [
+                        "Represent proposed work as explicit planning phases.",
+                    ],
+                    "constraints": [
+                        "Reject malformed dependency graphs before publish.",
+                    ],
+                    "candidateIssueTypes": ["epic", "child"],
+                    "publicationIntent": "issue_set_publish",
+                }
+            ],
+        )
+        planning_pack = build_planning_pack(
+            proposal_pack,
+            plan_items=[
+                {
+                    "itemKey": "capture-pack-shape",
+                    "proposalKey": "phase-2-planning",
+                    "phase": "design",
+                    "title": "Capture planning-pack shape",
+                    "summary": "Define the machine-readable planning artifact and source metadata.",
+                    "dependsOn": [],
+                },
+                {
+                    "itemKey": "validate-dag",
+                    "proposalKey": "phase-2-planning",
+                    "phase": "validation",
+                    "title": "Validate planning DAGs",
+                    "summary": "Reject cycles, missing parents, and malformed planning graphs.",
+                    "dependsOn": ["capture-pack-shape"],
+                },
+            ],
+        )
+
+        publish_plan = build_roadmap_continuity_issue_set_publish_plan(
+            planning_pack,
+            publish_decisions={
+                "roadmap": "publish",
+                "epic:phase-2-planning": "publish",
+                "child:capture-pack-shape": "publish",
+                "child:validate-dag": "draft",
+            },
+            issue_lint_results={
+                "roadmap": {
+                    "executionReady": True,
+                    "missingRequired": [],
+                    "metadataErrors": [],
+                    "highRiskBlockingAmbiguity": None,
+                },
+                "epic:phase-2-planning": {
+                    "executionReady": True,
+                    "missingRequired": [],
+                    "metadataErrors": [],
+                    "highRiskBlockingAmbiguity": None,
+                },
+                "child:capture-pack-shape": {
+                    "executionReady": True,
+                    "missingRequired": [],
+                    "metadataErrors": [],
+                    "highRiskBlockingAmbiguity": None,
+                },
+            },
+        )
+
+        self.assertEqual(
+            publish_plan["artifactType"],
+            "roadmap_continuity_issue_set_publish_plan",
+        )
+        self.assertEqual(
+            publish_plan["summary"],
+            {
+                "issueCount": 4,
+                "promotedCount": 3,
+                "draftCount": 1,
+                "quarantinedCount": 0,
+            },
+        )
+        self.assertEqual(
+            [item["publishKey"] for item in publish_plan["issueSet"]],
+            [
+                "roadmap",
+                "epic:phase-2-planning",
+                "child:capture-pack-shape",
+                "child:validate-dag",
+            ],
+        )
+        self.assertEqual(
+            [item["promotion"]["decision"] for item in publish_plan["issueSet"]],
+            ["promote", "promote", "promote", "draft"],
+        )
+        self.assertEqual(
+            publish_plan["issueSet"][0]["draftIssue"]["labels"],
+            ["codex", "roadmap-continuity", "roadmap"],
+        )
+        self.assertEqual(
+            publish_plan["issueSet"][1]["draftIssue"]["canonicalMetadata"],
+            {
+                "issueType": "epic",
+                "proposalKey": "phase-2-planning",
+                "partOf": "roadmap",
+                "dependsOn": [],
+                "parallelizable": False,
+                "executionOrder": "2 of 4",
+            },
+        )
+        self.assertEqual(
+            publish_plan["issueSet"][2]["draftIssue"]["canonicalMetadata"],
+            {
+                "issueType": "child",
+                "proposalKey": "phase-2-planning",
+                "itemKey": "capture-pack-shape",
+                "partOf": "epic:phase-2-planning",
+                "dependsOn": [],
+                "parallelizable": False,
+                "executionOrder": "3 of 4",
+            },
+        )
+        self.assertIn("Part of: #1", publish_plan["issueSet"][0]["draftIssue"]["body"])
+        self.assertIn(
+            "## Execution order\n4 of 4",
+            publish_plan["issueSet"][3]["draftIssue"]["body"],
+        )
+
+    def test_planning_pack_withholds_roadmap_continuity_issue_set_when_envelope_is_draft_only(
+        self,
+    ) -> None:
+        job = PostEpicEvaluationJob(
+            repository_full_name="TommyKammy/AutomationPlus",
+            epic_issue_number=1,
+            epic_issue_title="Epic: Phase 1 foundations for AutomationPlus loop automation",
+            epic_issue_url="https://github.com/TommyKammy/AutomationPlus/issues/1",
+            evaluation_trigger="epic.completed",
+            target_sha="dddddddddddddddddddddddddddddddddddddddd",
+            target_ref="refs/heads/main",
+            child_issues=[
+                EpicChildIssueState(
+                    issue_number=42,
+                    title="Build planning pack generation with DAG checker",
+                    state="open",
+                    conclusion="not_completed",
+                    issue_url="https://github.com/TommyKammy/AutomationPlus/issues/42",
+                ),
+            ],
+            generated_at="2026-04-15T04:15:00Z",
+        )
+
+        findings_pack = build_post_epic_findings_pack(evaluate_completed_epic(job))
+        proposal_pack = build_roadmap_proposal_pack(
+            findings_pack,
+            proposals=[
+                {
+                    "proposalKey": "phase-2-planning",
+                    "title": "Phase 2 planning pack generation",
+                    "summary": "Turn approved roadmap proposals into execution-ready planning artifacts.",
+                    "goals": [
+                        "Represent proposed work as explicit planning phases.",
+                    ],
+                    "constraints": [
+                        "Reject malformed dependency graphs before publish.",
+                    ],
+                    "candidateIssueTypes": ["epic", "child"],
+                    "publicationIntent": "issue_set_publish",
+                }
+            ],
+        )
+        planning_pack = build_planning_pack(
+            proposal_pack,
+            plan_items=[
+                {
+                    "itemKey": "capture-pack-shape",
+                    "proposalKey": "phase-2-planning",
+                    "phase": "design",
+                    "title": "Capture planning-pack shape",
+                    "summary": "Define the machine-readable planning artifact and source metadata.",
+                    "dependsOn": [],
+                }
+            ],
+        )
+
+        publish_plan = build_roadmap_continuity_issue_set_publish_plan(
+            planning_pack,
+            publish_decisions={
+                "roadmap": "publish",
+                "epic:phase-2-planning": "publish",
+                "child:capture-pack-shape": "publish",
+            },
+            issue_lint_results={
+                "roadmap": {
+                    "executionReady": True,
+                    "missingRequired": [],
+                    "metadataErrors": [],
+                    "highRiskBlockingAmbiguity": None,
+                },
+                "epic:phase-2-planning": {
+                    "executionReady": True,
+                    "missingRequired": [],
+                    "metadataErrors": [],
+                    "highRiskBlockingAmbiguity": None,
+                },
+                "child:capture-pack-shape": {
+                    "executionReady": True,
+                    "missingRequired": [],
+                    "metadataErrors": [],
+                    "highRiskBlockingAmbiguity": None,
+                },
+            },
+        )
+
+        self.assertEqual(planning_pack["continuityEnvelope"]["promotionState"], "draft_only")
+        self.assertEqual(
+            [item["promotion"] for item in publish_plan["issueSet"]],
+            [
+                {"decision": "draft", "reason": "continuity_envelope_draft_only"},
+                {"decision": "draft", "reason": "continuity_envelope_draft_only"},
+                {"decision": "draft", "reason": "continuity_envelope_draft_only"},
+            ],
+        )
+        self.assertEqual(
+            publish_plan["summary"],
+            {
+                "issueCount": 3,
+                "promotedCount": 0,
+                "draftCount": 3,
+                "quarantinedCount": 0,
+            },
+        )
 
 
 if __name__ == "__main__":
