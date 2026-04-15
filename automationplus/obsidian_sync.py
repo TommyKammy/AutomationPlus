@@ -11,6 +11,8 @@ GENERATED_NOTE_ALLOWED_ROOTS = (
     Path(".codex-supervisor") / "generated" / "obsidian" / "notes",
     Path("obsidian") / "generated",
 )
+CURATED_NOTE_PATCH_ALLOWED_ROOTS = (Path("obsidian") / "roadmap",)
+CURATED_NOTE_PATCH_ALLOWED_OPERATIONS = ("replace_text",)
 DEFAULT_QUARANTINE_RELATIVE_PATH = (
     Path(".codex-supervisor") / "generated" / "obsidian" / "quarantine.json"
 )
@@ -104,6 +106,30 @@ def _write_json_atomic(root: Path, path: Path, payload: dict[str, Any]) -> None:
     _write_text_atomic(root, path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
+def _read_text_no_symlinks(root: Path, path: Path) -> str:
+    relative_path = _path_relative_to_root(path, root)
+    parent_fd = _open_directory_no_symlinks(root, relative_path.parent)
+    file_fd: Optional[int] = None
+    try:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            file_fd = os.open(relative_path.name, flags, dir_fd=parent_fd)
+        except OSError as exc:
+            unsafe = _unsafe_path_error(exc)
+            if unsafe is not None:
+                raise unsafe from exc
+            raise
+        with os.fdopen(file_fd, "rb") as handle:
+            file_fd = None
+            return handle.read().decode("utf-8")
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        os.close(parent_fd)
+
+
 def _relative_to_root(path: Path, root: Path) -> Optional[Path]:
     try:
         return path.resolve().relative_to(root.resolve())
@@ -137,6 +163,19 @@ def _path_allowed(output_path: Path, vault_root: Path) -> bool:
         return False
 
     for allowed_root in GENERATED_NOTE_ALLOWED_ROOTS:
+        resolved_allowed_root = (resolved_vault_root / allowed_root).resolve()
+        if _relative_to_root(resolved_output, resolved_allowed_root) is not None:
+            return True
+    return False
+
+
+def _path_allowed_in_roots(output_path: Path, vault_root: Path, allowed_roots: tuple[Path, ...]) -> bool:
+    resolved_output = output_path.resolve()
+    resolved_vault_root = vault_root.resolve()
+    if _relative_to_root(resolved_output, resolved_vault_root) is None:
+        return False
+
+    for allowed_root in allowed_roots:
         resolved_allowed_root = (resolved_vault_root / allowed_root).resolve()
         if _relative_to_root(resolved_output, resolved_allowed_root) is not None:
             return True
@@ -232,5 +271,269 @@ def write_generated_note_sync(
     artifact["decision"] = {
         "status": "written",
         "reasonCode": "allowed_generated_path",
+    }
+    return artifact
+
+
+def _curated_note_patch_artifact(
+    *,
+    workspace_root: Path,
+    vault_root: Path,
+    patch_artifact: dict[str, Any],
+    loop_status_payload: dict[str, Any],
+    generated_at: str,
+) -> dict[str, Any]:
+    return {
+        "schemaVersion": 1,
+        "artifactType": "obsidian_curated_note_patch_result",
+        "generatedAt": generated_at,
+        "policy": {
+            "mode": "curated_note_patch_policy",
+            "allowedRoots": [path.as_posix() for path in CURATED_NOTE_PATCH_ALLOWED_ROOTS],
+            "allowedOperations": list(CURATED_NOTE_PATCH_ALLOWED_OPERATIONS),
+            "requiresApprovedArtifact": True,
+            "requiresExistingNote": True,
+            "matchMode": "exact_single_replace",
+        },
+        "sourceArtifact": {
+            "artifactType": patch_artifact.get("artifactType"),
+            "approvalStatus": patch_artifact.get("approval", {}).get("status")
+            if isinstance(patch_artifact.get("approval"), dict)
+            else None,
+        },
+        "serviceState": {
+            "status": loop_status_payload.get("status"),
+            "failurePolicy": loop_status_payload.get("failurePolicy"),
+        },
+        "patches": [],
+        "paths": {
+            "workspaceRoot": str(workspace_root.resolve()),
+            "vaultRoot": str(vault_root.resolve()),
+            "quarantinePath": str((workspace_root / DEFAULT_QUARANTINE_RELATIVE_PATH).resolve()),
+        },
+    }
+
+
+def _blocked_patch_result(
+    *,
+    target_path: str,
+    operation: Any,
+    reason_code: str,
+) -> dict[str, Any]:
+    return {
+        "targetPath": target_path,
+        "operation": operation,
+        "decision": {
+            "status": "blocked",
+            "reasonCode": reason_code,
+        },
+    }
+
+
+def apply_curated_note_patch_artifact(
+    *,
+    workspace_root: Path,
+    vault_root: Path,
+    patch_artifact: dict[str, Any],
+    loop_status_payload: dict[str, Any],
+    generated_at: str,
+) -> dict[str, Any]:
+    workspace_root = Path(workspace_root).resolve()
+    vault_root = Path(vault_root).resolve()
+    quarantine_path = (workspace_root / DEFAULT_QUARANTINE_RELATIVE_PATH).resolve()
+
+    artifact = _curated_note_patch_artifact(
+        workspace_root=workspace_root,
+        vault_root=vault_root,
+        patch_artifact=patch_artifact,
+        loop_status_payload=loop_status_payload,
+        generated_at=generated_at,
+    )
+
+    if not _service_is_safe(loop_status_payload):
+        artifact["decision"] = {
+            "status": "skipped",
+            "reasonCode": "service_not_safe_for_curated_note_patch",
+        }
+        _write_json_atomic(workspace_root, quarantine_path, artifact)
+        return artifact
+
+    if patch_artifact.get("artifactType") != "roadmap_continuity_note_patch_plan":
+        artifact["decision"] = {
+            "status": "blocked",
+            "reasonCode": "curated_note_patch_policy_violation",
+        }
+        artifact["patches"] = [
+            _blocked_patch_result(
+                target_path="",
+                operation=None,
+                reason_code="unexpected_patch_artifact_type",
+            )
+        ]
+        _write_json_atomic(workspace_root, quarantine_path, artifact)
+        return artifact
+
+    approval = patch_artifact.get("approval")
+    if not isinstance(approval, dict) or approval.get("status") != "approved":
+        artifact["decision"] = {
+            "status": "blocked",
+            "reasonCode": "curated_note_patch_policy_violation",
+        }
+        artifact["patches"] = [
+            _blocked_patch_result(
+                target_path="",
+                operation=None,
+                reason_code="artifact_not_approved",
+            )
+        ]
+        _write_json_atomic(workspace_root, quarantine_path, artifact)
+        return artifact
+
+    patches = patch_artifact.get("patches")
+    if not isinstance(patches, list) or not patches:
+        artifact["decision"] = {
+            "status": "blocked",
+            "reasonCode": "curated_note_patch_policy_violation",
+        }
+        artifact["patches"] = [
+            _blocked_patch_result(
+                target_path="",
+                operation=None,
+                reason_code="missing_patch_operations",
+            )
+        ]
+        _write_json_atomic(workspace_root, quarantine_path, artifact)
+        return artifact
+
+    pending_writes: list[tuple[Path, str, dict[str, Any]]] = []
+    for patch in patches:
+        target_path = patch.get("targetPath")
+        operation = patch.get("operation")
+        if not isinstance(target_path, str) or not target_path:
+            artifact["patches"].append(
+                _blocked_patch_result(
+                    target_path="",
+                    operation=operation,
+                    reason_code="missing_target_path",
+                )
+            )
+            continue
+        if operation not in CURATED_NOTE_PATCH_ALLOWED_OPERATIONS:
+            artifact["patches"].append(
+                _blocked_patch_result(
+                    target_path=target_path,
+                    operation=operation,
+                    reason_code="operation_not_allowed",
+                )
+            )
+            continue
+
+        resolved_target_path = (vault_root / Path(target_path)).resolve()
+        if not _path_allowed_in_roots(
+            resolved_target_path, vault_root, CURATED_NOTE_PATCH_ALLOWED_ROOTS
+        ):
+            artifact["patches"].append(
+                _blocked_patch_result(
+                    target_path=target_path,
+                    operation=operation,
+                    reason_code="target_path_not_allowed",
+                )
+            )
+            continue
+
+        if not resolved_target_path.exists():
+            artifact["patches"].append(
+                _blocked_patch_result(
+                    target_path=target_path,
+                    operation=operation,
+                    reason_code="target_note_missing",
+                )
+            )
+            continue
+
+        match_text = patch.get("matchText")
+        replacement_text = patch.get("replacementText")
+        if not isinstance(match_text, str) or not isinstance(replacement_text, str):
+            artifact["patches"].append(
+                _blocked_patch_result(
+                    target_path=target_path,
+                    operation=operation,
+                    reason_code="invalid_patch_payload",
+                )
+            )
+            continue
+
+        try:
+            original_content = _read_text_no_symlinks(vault_root, resolved_target_path)
+        except (FileNotFoundError, UnsafeGeneratedPathError):
+            artifact["patches"].append(
+                _blocked_patch_result(
+                    target_path=target_path,
+                    operation=operation,
+                    reason_code="target_note_missing",
+                )
+            )
+            continue
+
+        if original_content.count(match_text) != 1:
+            artifact["patches"].append(
+                _blocked_patch_result(
+                    target_path=target_path,
+                    operation=operation,
+                    reason_code="match_text_not_unique",
+                )
+            )
+            continue
+
+        updated_content = original_content.replace(match_text, replacement_text, 1)
+        pending_writes.append(
+            (
+                resolved_target_path,
+                updated_content,
+                {
+                    "targetPath": target_path,
+                    "operation": operation,
+                    "decision": {
+                        "status": "approved",
+                        "reasonCode": "patch_within_policy",
+                    },
+                },
+            )
+        )
+
+    if len(pending_writes) != len(patches):
+        artifact["decision"] = {
+            "status": "blocked",
+            "reasonCode": "curated_note_patch_policy_violation",
+        }
+        _write_json_atomic(workspace_root, quarantine_path, artifact)
+        return artifact
+
+    try:
+        for resolved_target_path, updated_content, patch_result in pending_writes:
+            _write_text_atomic(vault_root, resolved_target_path, updated_content)
+            patch_result["decision"] = {
+                "status": "applied",
+                "reasonCode": "patch_applied",
+            }
+            artifact["patches"].append(patch_result)
+    except UnsafeGeneratedPathError:
+        artifact["decision"] = {
+            "status": "blocked",
+            "reasonCode": "curated_note_patch_policy_violation",
+        }
+        artifact["patches"] = [
+            _blocked_patch_result(
+                target_path="",
+                operation=None,
+                reason_code="target_path_not_safely_reachable",
+            )
+        ]
+        _write_json_atomic(workspace_root, quarantine_path, artifact)
+        return artifact
+
+    artifact["decision"] = {
+        "status": "applied",
+        "reasonCode": "curated_note_patch_applied",
     }
     return artifact
