@@ -9,10 +9,12 @@ from automationplus.post_epic_evaluator import (
     PullRequestFact,
     build_post_epic_findings_pack,
     build_post_epic_follow_up_issue_publish_plan,
+    build_roadmap_proposal_pack,
     evaluate_completed_epic,
     write_post_epic_findings_pack,
     write_post_epic_evaluation_artifact,
     write_post_epic_follow_up_issue_publish_plan,
+    write_roadmap_proposal_pack,
 )
 
 
@@ -725,6 +727,163 @@ Parallelizable: No
             },
         )
         self.assertNotIn("quarantine", publish_plan)
+
+    def test_findings_pack_can_render_versioned_roadmap_proposal_pack(self) -> None:
+        job = PostEpicEvaluationJob(
+            repository_full_name="TommyKammy/AutomationPlus",
+            epic_issue_number=1,
+            epic_issue_title="Epic: Phase 1 foundations for AutomationPlus loop automation",
+            epic_issue_url="https://github.com/TommyKammy/AutomationPlus/issues/1",
+            evaluation_trigger="epic.completed",
+            target_sha="6666666666666666666666666666666666666666",
+            target_ref="refs/heads/main",
+            child_issues=[
+                EpicChildIssueState(
+                    issue_number=8,
+                    title="Build post-Epic follow-up issue publisher",
+                    state="open",
+                    conclusion="not_completed",
+                    issue_url="https://github.com/TommyKammy/AutomationPlus/issues/8",
+                ),
+            ],
+            related_pull_requests=[
+                PullRequestFact(
+                    number=21,
+                    title="Stabilize post-epic publish plan gating",
+                    state="open",
+                    merged=False,
+                    target_branch="main",
+                    merge_commit_sha=None,
+                    pull_request_url="https://github.com/TommyKammy/AutomationPlus/pull/21",
+                    source_issue_numbers=[8],
+                ),
+            ],
+            generated_at="2026-04-15T02:00:00Z",
+        )
+
+        findings_pack = build_post_epic_findings_pack(evaluate_completed_epic(job))
+        proposal_pack = build_roadmap_proposal_pack(
+            findings_pack,
+            proposals=[
+                {
+                    "proposalKey": "phase-2-execution",
+                    "title": "Phase 2 execution hardening and publish automation",
+                    "summary": "Turn the post-epic continuity findings into a bounded next-phase plan.",
+                    "goals": [
+                        "Define planning-pack generation inputs from the proposal artifact.",
+                        "Keep publication intent explicit for later issue and roadmap steps.",
+                    ],
+                    "constraints": [
+                        "Do not publish issues directly from roadmap completion.",
+                        "Do not validate planning DAGs in this phase proposal.",
+                    ],
+                    "candidateIssueTypes": ["planning_pack", "publish_plan"],
+                    "publicationIntent": "planning_input",
+                }
+            ],
+        )
+
+        self.assertEqual(proposal_pack["schemaVersion"], 1)
+        self.assertEqual(proposal_pack["artifactType"], "roadmap_proposal_pack")
+        self.assertEqual(proposal_pack["sourceArtifact"]["artifactType"], "post_epic_findings_pack")
+        self.assertEqual(proposal_pack["continuityContext"]["epic"]["issueNumber"], 1)
+        self.assertEqual(
+            proposal_pack["continuityContext"]["target"],
+            {
+                "ref": "refs/heads/main",
+                "sha": "6666666666666666666666666666666666666666",
+            },
+        )
+        self.assertEqual(proposal_pack["summary"]["proposalCount"], 1)
+        self.assertEqual(
+            proposal_pack["proposals"][0],
+            {
+                "proposalKey": "phase-2-execution",
+                "title": "Phase 2 execution hardening and publish automation",
+                "summary": "Turn the post-epic continuity findings into a bounded next-phase plan.",
+                "goals": [
+                    "Define planning-pack generation inputs from the proposal artifact.",
+                    "Keep publication intent explicit for later issue and roadmap steps.",
+                ],
+                "constraints": [
+                    "Do not publish issues directly from roadmap completion.",
+                    "Do not validate planning DAGs in this phase proposal.",
+                ],
+                "candidateIssueTypes": ["planning_pack", "publish_plan"],
+                "publicationIntent": "planning_input",
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            output_path = Path(tempdir) / "roadmap-proposal-pack.json"
+            persisted = write_roadmap_proposal_pack(
+                output_path,
+                findings_pack,
+                proposals=[
+                    {
+                        "proposalKey": "phase-2-execution",
+                        "title": "Phase 2 execution hardening and publish automation",
+                        "summary": "Turn the post-epic continuity findings into a bounded next-phase plan.",
+                        "goals": [
+                            "Define planning-pack generation inputs from the proposal artifact.",
+                            "Keep publication intent explicit for later issue and roadmap steps.",
+                        ],
+                        "constraints": [
+                            "Do not publish issues directly from roadmap completion.",
+                            "Do not validate planning DAGs in this phase proposal.",
+                        ],
+                        "candidateIssueTypes": ["planning_pack", "publish_plan"],
+                        "publicationIntent": "planning_input",
+                    }
+                ],
+            )
+            on_disk = json.loads(output_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(persisted, proposal_pack)
+        self.assertEqual(on_disk, proposal_pack)
+
+    def test_roadmap_proposal_pack_rejects_schema_invalid_proposal_payload(self) -> None:
+        job = PostEpicEvaluationJob(
+            repository_full_name="TommyKammy/AutomationPlus",
+            epic_issue_number=1,
+            epic_issue_title="Epic: Phase 1 foundations for AutomationPlus loop automation",
+            epic_issue_url="https://github.com/TommyKammy/AutomationPlus/issues/1",
+            evaluation_trigger="epic.completed",
+            target_sha="7777777777777777777777777777777777777777",
+            target_ref="refs/heads/main",
+            child_issues=[
+                EpicChildIssueState(
+                    issue_number=8,
+                    title="Build post-Epic follow-up issue publisher",
+                    state="open",
+                    conclusion="not_completed",
+                    issue_url="https://github.com/TommyKammy/AutomationPlus/issues/8",
+                ),
+            ],
+            generated_at="2026-04-15T02:15:00Z",
+        )
+
+        findings_pack = build_post_epic_findings_pack(evaluate_completed_epic(job))
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "proposal\\[0\\] missing required fields: goals",
+        ):
+            build_roadmap_proposal_pack(
+                findings_pack,
+                proposals=[
+                    {
+                        "proposalKey": "phase-2-execution",
+                        "title": "Phase 2 execution hardening and publish automation",
+                        "summary": "Turn the post-epic continuity findings into a bounded next-phase plan.",
+                        "constraints": [
+                            "Do not publish issues directly from roadmap completion."
+                        ],
+                        "candidateIssueTypes": ["planning_pack"],
+                        "publicationIntent": "planning_input",
+                    }
+                ],
+            )
 
 
 if __name__ == "__main__":

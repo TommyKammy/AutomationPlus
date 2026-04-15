@@ -574,3 +574,141 @@ def write_post_epic_findings_pack(
 
     temp_path.replace(output_path)
     return findings_pack
+
+
+def _normalized_string_list(value: Any) -> Optional[list[str]]:
+    if not isinstance(value, list):
+        return None
+
+    normalized: list[str] = []
+    for entry in value:
+        if not isinstance(entry, str):
+            return None
+        stripped = entry.strip()
+        if not stripped:
+            return None
+        normalized.append(stripped)
+
+    return normalized
+
+
+def _validate_roadmap_proposal(index: int, proposal: Any) -> dict[str, Any]:
+    if not isinstance(proposal, dict):
+        raise ValueError(f"proposal[{index}] must be an object")
+
+    required_fields = [
+        "proposalKey",
+        "title",
+        "summary",
+        "goals",
+        "constraints",
+        "candidateIssueTypes",
+        "publicationIntent",
+    ]
+    missing_fields = [field for field in required_fields if field not in proposal]
+    if missing_fields:
+        raise ValueError(
+            f"proposal[{index}] missing required fields: {', '.join(missing_fields)}"
+        )
+
+    normalized: dict[str, Any] = {}
+    for field_name in ("proposalKey", "title", "summary", "publicationIntent"):
+        raw_value = proposal.get(field_name)
+        if not isinstance(raw_value, str) or not raw_value.strip():
+            raise ValueError(f"proposal[{index}].{field_name} must be a non-empty string")
+        normalized[field_name] = raw_value.strip()
+
+    for field_name in ("goals", "constraints", "candidateIssueTypes"):
+        normalized_list = _normalized_string_list(proposal.get(field_name))
+        if normalized_list is None or not normalized_list:
+            raise ValueError(
+                f"proposal[{index}].{field_name} must be a non-empty list of non-empty strings"
+            )
+        normalized[field_name] = normalized_list
+
+    return normalized
+
+
+def build_roadmap_proposal_pack(
+    findings_pack: dict[str, Any],
+    *,
+    proposals: list[dict[str, Any]],
+) -> dict[str, Any]:
+    source_artifact = findings_pack.get("sourceArtifact")
+    if not isinstance(source_artifact, dict):
+        source_artifact = {}
+
+    evaluation = source_artifact.get("evaluation")
+    if not isinstance(evaluation, dict):
+        evaluation = {}
+    evaluation = copy.deepcopy(evaluation)
+
+    epic = evaluation.get("epic")
+    if not isinstance(epic, dict):
+        epic = {}
+    epic = copy.deepcopy(epic)
+
+    target = source_artifact.get("target")
+    if not isinstance(target, dict):
+        target = {}
+    target = copy.deepcopy(target)
+
+    actionable_findings = findings_pack.get("actionableFindings")
+    if not isinstance(actionable_findings, list):
+        actionable_findings = []
+    actionable_findings = copy.deepcopy(actionable_findings)
+
+    validated_proposals = [
+        _validate_roadmap_proposal(index, proposal)
+        for index, proposal in enumerate(proposals)
+    ]
+
+    return {
+        "schemaVersion": 1,
+        "artifactType": "roadmap_proposal_pack",
+        "generatedAt": findings_pack.get("generatedAt"),
+        "sourceArtifact": {
+            "artifactType": findings_pack.get("artifactType"),
+            "generatedAt": findings_pack.get("generatedAt"),
+            "evaluation": evaluation,
+            "target": target,
+        },
+        "continuityContext": {
+            "epic": epic,
+            "evaluationTrigger": evaluation.get("trigger"),
+            "target": target,
+            "actionableFindings": actionable_findings,
+        },
+        "proposals": validated_proposals,
+        "summary": {
+            "proposalCount": len(validated_proposals),
+            "actionableFindingCount": len(actionable_findings),
+        },
+    }
+
+
+def write_roadmap_proposal_pack(
+    output_path: Path,
+    findings_pack: dict[str, Any],
+    *,
+    proposals: list[dict[str, Any]],
+) -> dict[str, Any]:
+    proposal_pack = build_roadmap_proposal_pack(
+        findings_pack,
+        proposals=proposals,
+    )
+    output_path = Path(output_path).resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=str(output_path.parent),
+        delete=False,
+    ) as handle:
+        json.dump(proposal_pack, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        temp_path = Path(handle.name)
+
+    temp_path.replace(output_path)
+    return proposal_pack
