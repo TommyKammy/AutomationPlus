@@ -9,11 +9,13 @@ from automationplus.post_epic_evaluator import (
     PullRequestFact,
     build_post_epic_findings_pack,
     build_post_epic_follow_up_issue_publish_plan,
+    build_planning_pack,
     build_roadmap_proposal_pack,
     evaluate_completed_epic,
     write_post_epic_findings_pack,
     write_post_epic_evaluation_artifact,
     write_post_epic_follow_up_issue_publish_plan,
+    write_planning_pack,
     write_roadmap_proposal_pack,
 )
 
@@ -915,6 +917,378 @@ Parallelizable: No
             build_roadmap_proposal_pack(  # type: ignore[arg-type]
                 findings_pack,
                 proposals=None,
+            )
+
+    def test_roadmap_proposal_pack_can_render_planning_pack_with_execution_order(self) -> None:
+        job = PostEpicEvaluationJob(
+            repository_full_name="TommyKammy/AutomationPlus",
+            epic_issue_number=1,
+            epic_issue_title="Epic: Phase 1 foundations for AutomationPlus loop automation",
+            epic_issue_url="https://github.com/TommyKammy/AutomationPlus/issues/1",
+            evaluation_trigger="epic.completed",
+            target_sha="9999999999999999999999999999999999999999",
+            target_ref="refs/heads/main",
+            child_issues=[
+                EpicChildIssueState(
+                    issue_number=42,
+                    title="Build planning pack generation with DAG checker",
+                    state="open",
+                    conclusion="not_completed",
+                    issue_url="https://github.com/TommyKammy/AutomationPlus/issues/42",
+                ),
+            ],
+            generated_at="2026-04-15T03:00:00Z",
+        )
+
+        findings_pack = build_post_epic_findings_pack(evaluate_completed_epic(job))
+        proposal_pack = build_roadmap_proposal_pack(
+            findings_pack,
+            proposals=[
+                {
+                    "proposalKey": "phase-2-planning",
+                    "title": "Phase 2 planning pack generation",
+                    "summary": "Turn approved roadmap proposals into execution-ready planning artifacts.",
+                    "goals": [
+                        "Represent proposed work as explicit planning phases.",
+                        "Preserve dependency metadata for downstream publish logic.",
+                    ],
+                    "constraints": [
+                        "Reject malformed dependency graphs before publish.",
+                        "Do not publish any GitHub artifacts from this planning step.",
+                    ],
+                    "candidateIssueTypes": ["planning_pack"],
+                    "publicationIntent": "planning_input",
+                }
+            ],
+        )
+
+        planning_pack = build_planning_pack(
+            proposal_pack,
+            plan_items=[
+                {
+                    "itemKey": "capture-pack-shape",
+                    "proposalKey": "phase-2-planning",
+                    "phase": "design",
+                    "title": "Capture planning-pack shape",
+                    "summary": "Define the machine-readable planning artifact and source metadata.",
+                    "dependsOn": [],
+                },
+                {
+                    "itemKey": "validate-dag",
+                    "proposalKey": "phase-2-planning",
+                    "phase": "validation",
+                    "title": "Validate planning DAGs",
+                    "summary": "Reject cycles, missing parents, and malformed planning graphs.",
+                    "dependsOn": ["capture-pack-shape"],
+                },
+                {
+                    "itemKey": "persist-artifact",
+                    "proposalKey": "phase-2-planning",
+                    "phase": "delivery",
+                    "title": "Persist planning pack artifact",
+                    "summary": "Write the stable artifact only after the graph passes validation.",
+                    "dependsOn": ["validate-dag"],
+                },
+            ],
+        )
+
+        self.assertEqual(planning_pack["schemaVersion"], 1)
+        self.assertEqual(planning_pack["artifactType"], "planning_pack")
+        self.assertEqual(
+            planning_pack["sourceArtifact"],
+            {
+                "artifactType": "roadmap_proposal_pack",
+                "generatedAt": "2026-04-15T03:00:00Z",
+                "evaluation": {
+                    "trigger": "epic.completed",
+                    "epic": {
+                        "issueNumber": 1,
+                        "title": "Epic: Phase 1 foundations for AutomationPlus loop automation",
+                        "issueUrl": "https://github.com/TommyKammy/AutomationPlus/issues/1",
+                    },
+                },
+                "target": {
+                    "ref": "refs/heads/main",
+                    "sha": "9999999999999999999999999999999999999999",
+                },
+            },
+        )
+        self.assertEqual(
+            planning_pack["graph"],
+            {
+                "roots": ["capture-pack-shape"],
+                "executionOrder": [
+                    "capture-pack-shape",
+                    "validate-dag",
+                    "persist-artifact",
+                ],
+            },
+        )
+        self.assertEqual(
+            planning_pack["phases"],
+            [
+                {
+                    "phase": "design",
+                    "itemKeys": ["capture-pack-shape"],
+                    "dependsOnPhases": [],
+                },
+                {
+                    "phase": "validation",
+                    "itemKeys": ["validate-dag"],
+                    "dependsOnPhases": ["design"],
+                },
+                {
+                    "phase": "delivery",
+                    "itemKeys": ["persist-artifact"],
+                    "dependsOnPhases": ["validation"],
+                },
+            ],
+        )
+        self.assertEqual(planning_pack["summary"]["itemCount"], 3)
+        self.assertEqual(planning_pack["summary"]["phaseCount"], 3)
+        self.assertEqual(planning_pack["summary"]["rootCount"], 1)
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            output_path = Path(tempdir) / "planning-pack.json"
+            persisted = write_planning_pack(
+                output_path,
+                proposal_pack,
+                plan_items=[
+                    {
+                        "itemKey": "capture-pack-shape",
+                        "proposalKey": "phase-2-planning",
+                        "phase": "design",
+                        "title": "Capture planning-pack shape",
+                        "summary": "Define the machine-readable planning artifact and source metadata.",
+                        "dependsOn": [],
+                    },
+                    {
+                        "itemKey": "validate-dag",
+                        "proposalKey": "phase-2-planning",
+                        "phase": "validation",
+                        "title": "Validate planning DAGs",
+                        "summary": "Reject cycles, missing parents, and malformed planning graphs.",
+                        "dependsOn": ["capture-pack-shape"],
+                    },
+                    {
+                        "itemKey": "persist-artifact",
+                        "proposalKey": "phase-2-planning",
+                        "phase": "delivery",
+                        "title": "Persist planning pack artifact",
+                        "summary": "Write the stable artifact only after the graph passes validation.",
+                        "dependsOn": ["validate-dag"],
+                    },
+                ],
+            )
+            on_disk = json.loads(output_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(persisted, planning_pack)
+        self.assertEqual(on_disk, planning_pack)
+
+    def test_planning_pack_merges_dependency_phases_across_multi_item_phase(self) -> None:
+        proposal_pack = {
+            "generatedAt": "2026-04-15T03:00:00Z",
+            "proposals": [
+                {
+                    "proposalKey": "phase-2-planning",
+                }
+            ],
+        }
+
+        planning_pack = build_planning_pack(
+            proposal_pack,
+            plan_items=[
+                {
+                    "itemKey": "capture-pack-shape",
+                    "proposalKey": "phase-2-planning",
+                    "phase": "design",
+                    "title": "Capture planning-pack shape",
+                    "summary": "Define the machine-readable planning artifact and source metadata.",
+                    "dependsOn": [],
+                },
+                {
+                    "itemKey": "validate-dag",
+                    "proposalKey": "phase-2-planning",
+                    "phase": "validation",
+                    "title": "Validate planning DAGs",
+                    "summary": "Reject cycles and malformed graphs.",
+                    "dependsOn": ["capture-pack-shape"],
+                },
+                {
+                    "itemKey": "draft-implementation-plan",
+                    "proposalKey": "phase-2-planning",
+                    "phase": "execution",
+                    "title": "Draft implementation plan",
+                    "summary": "Lay out execution after the initial design is ready.",
+                    "dependsOn": ["capture-pack-shape"],
+                },
+                {
+                    "itemKey": "persist-artifact",
+                    "proposalKey": "phase-2-planning",
+                    "phase": "execution",
+                    "title": "Persist planning pack artifact",
+                    "summary": "Persist the plan after validation passes.",
+                    "dependsOn": ["validate-dag"],
+                },
+            ],
+        )
+
+        self.assertEqual(
+            planning_pack["phases"],
+            [
+                {
+                    "phase": "design",
+                    "itemKeys": ["capture-pack-shape"],
+                    "dependsOnPhases": [],
+                },
+                {
+                    "phase": "validation",
+                    "itemKeys": ["validate-dag"],
+                    "dependsOnPhases": ["design"],
+                },
+                {
+                    "phase": "execution",
+                    "itemKeys": [
+                        "draft-implementation-plan",
+                        "persist-artifact",
+                    ],
+                    "dependsOnPhases": ["design", "validation"],
+                },
+            ],
+        )
+
+    def test_planning_pack_rejects_missing_dependency_parent(self) -> None:
+        job = PostEpicEvaluationJob(
+            repository_full_name="TommyKammy/AutomationPlus",
+            epic_issue_number=1,
+            epic_issue_title="Epic: Phase 1 foundations for AutomationPlus loop automation",
+            epic_issue_url="https://github.com/TommyKammy/AutomationPlus/issues/1",
+            evaluation_trigger="epic.completed",
+            target_sha="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            target_ref="refs/heads/main",
+            child_issues=[
+                EpicChildIssueState(
+                    issue_number=42,
+                    title="Build planning pack generation with DAG checker",
+                    state="open",
+                    conclusion="not_completed",
+                    issue_url="https://github.com/TommyKammy/AutomationPlus/issues/42",
+                ),
+            ],
+            generated_at="2026-04-15T03:15:00Z",
+        )
+
+        findings_pack = build_post_epic_findings_pack(evaluate_completed_epic(job))
+        proposal_pack = build_roadmap_proposal_pack(
+            findings_pack,
+            proposals=[
+                {
+                    "proposalKey": "phase-2-planning",
+                    "title": "Phase 2 planning pack generation",
+                    "summary": "Turn approved roadmap proposals into execution-ready planning artifacts.",
+                    "goals": [
+                        "Represent proposed work as explicit planning phases.",
+                    ],
+                    "constraints": [
+                        "Reject malformed dependency graphs before publish.",
+                    ],
+                    "candidateIssueTypes": ["planning_pack"],
+                    "publicationIntent": "planning_input",
+                }
+            ],
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "plan_items\\[1\\] dependsOn references unknown itemKey: missing-parent",
+        ):
+            build_planning_pack(
+                proposal_pack,
+                plan_items=[
+                    {
+                        "itemKey": "capture-pack-shape",
+                        "proposalKey": "phase-2-planning",
+                        "phase": "design",
+                        "title": "Capture planning-pack shape",
+                        "summary": "Define the machine-readable planning artifact and source metadata.",
+                        "dependsOn": [],
+                    },
+                    {
+                        "itemKey": "validate-dag",
+                        "proposalKey": "phase-2-planning",
+                        "phase": "validation",
+                        "title": "Validate planning DAGs",
+                        "summary": "Reject cycles, missing parents, and malformed planning graphs.",
+                        "dependsOn": ["missing-parent"],
+                    },
+                ],
+            )
+
+    def test_planning_pack_rejects_cycles(self) -> None:
+        job = PostEpicEvaluationJob(
+            repository_full_name="TommyKammy/AutomationPlus",
+            epic_issue_number=1,
+            epic_issue_title="Epic: Phase 1 foundations for AutomationPlus loop automation",
+            epic_issue_url="https://github.com/TommyKammy/AutomationPlus/issues/1",
+            evaluation_trigger="epic.completed",
+            target_sha="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            target_ref="refs/heads/main",
+            child_issues=[
+                EpicChildIssueState(
+                    issue_number=42,
+                    title="Build planning pack generation with DAG checker",
+                    state="open",
+                    conclusion="not_completed",
+                    issue_url="https://github.com/TommyKammy/AutomationPlus/issues/42",
+                ),
+            ],
+            generated_at="2026-04-15T03:30:00Z",
+        )
+
+        findings_pack = build_post_epic_findings_pack(evaluate_completed_epic(job))
+        proposal_pack = build_roadmap_proposal_pack(
+            findings_pack,
+            proposals=[
+                {
+                    "proposalKey": "phase-2-planning",
+                    "title": "Phase 2 planning pack generation",
+                    "summary": "Turn approved roadmap proposals into execution-ready planning artifacts.",
+                    "goals": [
+                        "Represent proposed work as explicit planning phases.",
+                    ],
+                    "constraints": [
+                        "Reject malformed dependency graphs before publish.",
+                    ],
+                    "candidateIssueTypes": ["planning_pack"],
+                    "publicationIntent": "planning_input",
+                }
+            ],
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "planning DAG contains a cycle",
+        ):
+            build_planning_pack(
+                proposal_pack,
+                plan_items=[
+                    {
+                        "itemKey": "capture-pack-shape",
+                        "proposalKey": "phase-2-planning",
+                        "phase": "design",
+                        "title": "Capture planning-pack shape",
+                        "summary": "Define the machine-readable planning artifact and source metadata.",
+                        "dependsOn": ["validate-dag"],
+                    },
+                    {
+                        "itemKey": "validate-dag",
+                        "proposalKey": "phase-2-planning",
+                        "phase": "validation",
+                        "title": "Validate planning DAGs",
+                        "summary": "Reject cycles, missing parents, and malformed planning graphs.",
+                        "dependsOn": ["capture-pack-shape"],
+                    },
+                ],
             )
 
 
