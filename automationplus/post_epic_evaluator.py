@@ -665,6 +665,23 @@ def build_roadmap_proposal_pack(
         _validate_roadmap_proposal(index, proposal)
         for index, proposal in enumerate(proposals)
     ]
+    continuity_context = {
+        "epic": epic,
+        "evaluationTrigger": evaluation.get("trigger"),
+        "target": target,
+        "actionableFindings": actionable_findings,
+    }
+    continuity_envelope = _build_continuity_envelope(
+        source_artifact={
+            "artifactType": findings_pack.get("artifactType"),
+            "generatedAt": findings_pack.get("generatedAt"),
+            "target": target,
+        },
+        continuity_context=continuity_context,
+        artifact_ready_reason="proposal_pack_ready",
+        validated_signal_reason="proposal_pack_contains_validated_proposals",
+        has_validated_signal=bool(validated_proposals),
+    )
 
     return {
         "schemaVersion": 1,
@@ -676,12 +693,8 @@ def build_roadmap_proposal_pack(
             "evaluation": evaluation,
             "target": target,
         },
-        "continuityContext": {
-            "epic": epic,
-            "evaluationTrigger": evaluation.get("trigger"),
-            "target": target,
-            "actionableFindings": actionable_findings,
-        },
+        "continuityContext": continuity_context,
+        "continuityEnvelope": continuity_envelope,
         "proposals": validated_proposals,
         "summary": {
             "proposalCount": len(validated_proposals),
@@ -885,6 +898,18 @@ def build_planning_pack(
     source_target = source_artifact.get("target")
     if not isinstance(source_target, dict):
         source_target = {}
+    continuity_context = copy.deepcopy(proposal_pack.get("continuityContext", {}))
+    continuity_envelope = _build_continuity_envelope(
+        source_artifact={
+            "artifactType": proposal_pack.get("artifactType"),
+            "generatedAt": proposal_pack.get("generatedAt"),
+            "target": copy.deepcopy(source_target),
+        },
+        continuity_context=continuity_context,
+        artifact_ready_reason="planning_pack_ready",
+        validated_signal_reason="planning_pack_contains_validated_items",
+        has_validated_signal=bool(ordered_plan_items),
+    )
 
     return {
         "schemaVersion": 1,
@@ -896,7 +921,8 @@ def build_planning_pack(
             "evaluation": copy.deepcopy(source_evaluation),
             "target": copy.deepcopy(source_target),
         },
-        "continuityContext": copy.deepcopy(proposal_pack.get("continuityContext", {})),
+        "continuityContext": continuity_context,
+        "continuityEnvelope": continuity_envelope,
         "proposals": copy.deepcopy(proposals),
         "planItems": ordered_plan_items,
         "graph": {
@@ -938,3 +964,114 @@ def write_planning_pack(
 
     temp_path.replace(output_path)
     return planning_pack
+
+
+def _build_continuity_envelope(
+    *,
+    source_artifact: dict[str, Any],
+    continuity_context: dict[str, Any],
+    artifact_ready_reason: str,
+    validated_signal_reason: str,
+    has_validated_signal: bool,
+) -> dict[str, Any]:
+    actionable_findings = continuity_context.get("actionableFindings")
+    if not isinstance(actionable_findings, list):
+        actionable_findings = []
+
+    source_target = source_artifact.get("target")
+    if not isinstance(source_target, dict):
+        source_target = {}
+
+    continuity_target = continuity_context.get("target")
+    if not isinstance(continuity_target, dict):
+        continuity_target = {}
+
+    drift_reasons: list[str] = []
+    if (
+        isinstance(source_target.get("ref"), str)
+        and isinstance(continuity_target.get("ref"), str)
+        and source_target.get("ref") != continuity_target.get("ref")
+    ):
+        drift_reasons.append("continuity_target_mismatch")
+    if (
+        isinstance(source_target.get("sha"), str)
+        and isinstance(continuity_target.get("sha"), str)
+        and source_target.get("sha") != continuity_target.get("sha")
+        and "continuity_target_mismatch" not in drift_reasons
+    ):
+        drift_reasons.append("continuity_target_mismatch")
+
+    for finding in actionable_findings:
+        if not isinstance(finding, dict):
+            continue
+        finding_type = finding.get("findingType")
+        title = finding.get("title")
+        if (
+            finding_type == "strategy_drift_candidate"
+            or (isinstance(title, str) and "drift" in title.lower())
+        ) and "continuity_target_mismatch" not in drift_reasons:
+            drift_reasons.append("continuity_target_mismatch")
+
+    strategy_drift_detected = bool(drift_reasons)
+    strategy_drift = {
+        "status": "drift_detected" if strategy_drift_detected else "aligned",
+        "requiresReview": strategy_drift_detected,
+        "reasons": drift_reasons,
+    }
+
+    operator_review = {
+        "status": "required" if strategy_drift_detected else "not_required",
+        "required": strategy_drift_detected,
+        "reasons": ["strategy_drift_detected"] if strategy_drift_detected else [],
+    }
+
+    if strategy_drift_detected:
+        promotion_state = "quarantined"
+        publish_eligibility = {
+            "eligible": False,
+            "decision": "quarantined",
+            "reasons": [
+                "strategy_drift_detected",
+                "operator_review_required",
+            ],
+        }
+    else:
+        publish_eligibility = {
+            "eligible": True,
+            "decision": "publishable",
+            "reasons": [
+                artifact_ready_reason,
+            ],
+        }
+        if actionable_findings:
+            publish_eligibility["reasons"].append("actionable_findings_require_follow_up")
+        else:
+            publish_eligibility["reasons"].append("no_actionable_findings")
+        publish_eligibility["reasons"].extend(
+            ["no_strategy_drift", "operator_review_not_required"]
+        )
+        promotion_state = "publishable" if not actionable_findings else "draft_only"
+        if promotion_state == "draft_only":
+            publish_eligibility["eligible"] = False
+            publish_eligibility["decision"] = "draft_only"
+
+    confidence_reasons: list[str] = []
+    if not actionable_findings:
+        confidence_reasons.append("findings_pack_contains_no_actionable_findings")
+    if has_validated_signal:
+        confidence_reasons.append(validated_signal_reason)
+    if strategy_drift_detected:
+        confidence_reasons.append("strategy_drift_signal_present")
+
+    confidence_level = "medium" if strategy_drift_detected or actionable_findings else "high"
+
+    return {
+        "promotionState": promotion_state,
+        "publishEligibility": publish_eligibility,
+        "strategyDrift": strategy_drift,
+        "operatorReview": operator_review,
+        "confidence": {
+            "level": confidence_level,
+            "reasons": confidence_reasons,
+        },
+    }

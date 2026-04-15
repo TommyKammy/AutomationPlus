@@ -919,6 +919,181 @@ Parallelizable: No
                 proposals=None,
             )
 
+    def test_roadmap_proposal_pack_emits_publishable_continuity_envelope(self) -> None:
+        job = PostEpicEvaluationJob(
+            repository_full_name="TommyKammy/AutomationPlus",
+            epic_issue_number=1,
+            epic_issue_title="Epic: Phase 1 foundations for AutomationPlus loop automation",
+            epic_issue_url="https://github.com/TommyKammy/AutomationPlus/issues/1",
+            evaluation_trigger="epic.completed",
+            target_sha="1212121212121212121212121212121212121212",
+            target_ref="refs/heads/main",
+            child_issues=[],
+            generated_at="2026-04-15T02:45:00Z",
+        )
+
+        findings_pack = build_post_epic_findings_pack(evaluate_completed_epic(job))
+
+        proposal_pack = build_roadmap_proposal_pack(
+            findings_pack,
+            proposals=[
+                {
+                    "proposalKey": "phase-3-roadmap-continuity",
+                    "title": "Phase 3 roadmap continuity envelope",
+                    "summary": "Wrap proposal artifacts with explicit publish eligibility for roadmap continuity.",
+                    "goals": [
+                        "Carry explicit promotion state forward with the proposal output.",
+                    ],
+                    "constraints": [
+                        "Only mark continuity output publishable when no operator review or drift gate blocks promotion.",
+                    ],
+                    "candidateIssueTypes": ["planning_pack"],
+                    "publicationIntent": "planning_input",
+                }
+            ],
+        )
+
+        self.assertEqual(
+            proposal_pack["continuityEnvelope"],
+            {
+                "promotionState": "publishable",
+                "publishEligibility": {
+                    "eligible": True,
+                    "decision": "publishable",
+                    "reasons": [
+                        "proposal_pack_ready",
+                        "no_actionable_findings",
+                        "no_strategy_drift",
+                        "operator_review_not_required",
+                    ],
+                },
+                "strategyDrift": {
+                    "status": "aligned",
+                    "requiresReview": False,
+                    "reasons": [],
+                },
+                "operatorReview": {
+                    "status": "not_required",
+                    "required": False,
+                    "reasons": [],
+                },
+                "confidence": {
+                    "level": "high",
+                    "reasons": [
+                        "findings_pack_contains_no_actionable_findings",
+                        "proposal_pack_contains_validated_proposals",
+                    ],
+                },
+            },
+        )
+
+    def test_planning_pack_emits_quarantined_continuity_envelope_when_strategy_drift_requires_review(
+        self,
+    ) -> None:
+        proposal_pack = {
+            "schemaVersion": 1,
+            "artifactType": "roadmap_proposal_pack",
+            "generatedAt": "2026-04-15T03:45:00Z",
+            "sourceArtifact": {
+                "artifactType": "post_epic_findings_pack",
+                "generatedAt": "2026-04-15T03:30:00Z",
+                "evaluation": {
+                    "trigger": "epic.completed",
+                    "epic": {
+                        "issueNumber": 1,
+                        "title": "Epic: Phase 1 foundations for AutomationPlus loop automation",
+                        "issueUrl": "https://github.com/TommyKammy/AutomationPlus/issues/1",
+                    },
+                },
+                "target": {
+                    "ref": "refs/heads/main",
+                    "sha": "3434343434343434343434343434343434343434",
+                },
+            },
+            "continuityContext": {
+                "epic": {
+                    "issueNumber": 1,
+                    "title": "Epic: Phase 1 foundations for AutomationPlus loop automation",
+                    "issueUrl": "https://github.com/TommyKammy/AutomationPlus/issues/1",
+                },
+                "evaluationTrigger": "epic.completed",
+                "target": {
+                    "ref": "refs/heads/release-candidate",
+                    "sha": "5656565656565656565656565656565656565656",
+                },
+                "actionableFindings": [
+                    {
+                        "dedupeKey": "target-mismatch",
+                        "findingType": "strategy_drift_candidate",
+                        "title": "Continuity target diverged from the evaluated epic target.",
+                        "severity": "high",
+                        "confidence": "high",
+                        "novelty": "candidate",
+                        "sourceClassification": "meta_only",
+                        "evidence": {
+                            "expectedTargetRef": "refs/heads/main",
+                            "observedTargetRef": "refs/heads/release-candidate",
+                        },
+                    }
+                ],
+            },
+            "proposals": [
+                {
+                    "proposalKey": "phase-3-roadmap-continuity",
+                }
+            ],
+        }
+
+        planning_pack = build_planning_pack(
+            proposal_pack,
+            plan_items=[
+                {
+                    "itemKey": "implement-envelope",
+                    "proposalKey": "phase-3-roadmap-continuity",
+                    "phase": "implementation",
+                    "title": "Implement continuity envelope",
+                    "summary": "Wrap continuity output with explicit publish gating metadata.",
+                    "dependsOn": [],
+                }
+            ],
+        )
+
+        self.assertEqual(
+            planning_pack["continuityEnvelope"],
+            {
+                "promotionState": "quarantined",
+                "publishEligibility": {
+                    "eligible": False,
+                    "decision": "quarantined",
+                    "reasons": [
+                        "strategy_drift_detected",
+                        "operator_review_required",
+                    ],
+                },
+                "strategyDrift": {
+                    "status": "drift_detected",
+                    "requiresReview": True,
+                    "reasons": [
+                        "continuity_target_mismatch",
+                    ],
+                },
+                "operatorReview": {
+                    "status": "required",
+                    "required": True,
+                    "reasons": [
+                        "strategy_drift_detected",
+                    ],
+                },
+                "confidence": {
+                    "level": "medium",
+                    "reasons": [
+                        "planning_pack_contains_validated_items",
+                        "strategy_drift_signal_present",
+                    ],
+                },
+            },
+        )
+
     def test_roadmap_proposal_pack_can_render_planning_pack_with_execution_order(self) -> None:
         job = PostEpicEvaluationJob(
             repository_full_name="TommyKammy/AutomationPlus",
