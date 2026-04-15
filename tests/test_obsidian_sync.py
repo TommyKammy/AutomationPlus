@@ -199,6 +199,87 @@ class ObsidianGeneratedSyncTests(unittest.TestCase):
             self.assertEqual(quarantine["decision"]["status"], "blocked")
             self.assertEqual(quarantine["requestedPath"], "obsidian/generated/daily/summary.md")
 
+    def test_curated_note_patch_applies_approved_replace_text_within_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            workspace = Path(tempdir)
+            target_path = workspace / "obsidian" / "roadmap" / "quarterly-plan.md"
+            target_path.parent.mkdir(parents=True)
+            target_path.write_text(
+                "# Quarterly Plan\n\nStatus: Draft\nOwner: Tommy\n",
+                encoding="utf-8",
+            )
+
+            artifact = obsidian_sync.apply_curated_note_patch_artifact(
+                workspace_root=workspace,
+                vault_root=workspace,
+                patch_artifact={
+                    "artifactType": "roadmap_continuity_note_patch_plan",
+                    "approval": {"status": "approved"},
+                    "patches": [
+                        {
+                            "targetPath": "obsidian/roadmap/quarterly-plan.md",
+                            "operation": "replace_text",
+                            "matchText": "Status: Draft",
+                            "replacementText": "Status: Confirmed",
+                        }
+                    ],
+                },
+                loop_status_payload=self._healthy_loop_status(),
+                generated_at="2026-04-15T10:00:00Z",
+            )
+
+            self.assertEqual(artifact["decision"]["status"], "applied")
+            self.assertEqual(artifact["decision"]["reasonCode"], "curated_note_patch_applied")
+            self.assertEqual(artifact["policy"]["mode"], "curated_note_patch_policy")
+            self.assertEqual(
+                target_path.read_text(encoding="utf-8"),
+                "# Quarterly Plan\n\nStatus: Confirmed\nOwner: Tommy\n",
+            )
+            self.assertEqual(
+                artifact["patches"][0]["targetPath"],
+                "obsidian/roadmap/quarterly-plan.md",
+            )
+
+    def test_curated_note_patch_blocks_out_of_policy_target_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            workspace = Path(tempdir)
+            target_path = workspace / "Notes" / "Project.md"
+            target_path.parent.mkdir(parents=True)
+            target_path.write_text("# Project\n\nStatus: Draft\n", encoding="utf-8")
+
+            artifact = obsidian_sync.apply_curated_note_patch_artifact(
+                workspace_root=workspace,
+                vault_root=workspace,
+                patch_artifact={
+                    "artifactType": "roadmap_continuity_note_patch_plan",
+                    "approval": {"status": "approved"},
+                    "patches": [
+                        {
+                            "targetPath": "Notes/Project.md",
+                            "operation": "replace_text",
+                            "matchText": "Status: Draft",
+                            "replacementText": "Status: Confirmed",
+                        }
+                    ],
+                },
+                loop_status_payload=self._healthy_loop_status(),
+                generated_at="2026-04-15T10:00:00Z",
+            )
+
+            self.assertEqual(artifact["decision"]["status"], "blocked")
+            self.assertEqual(
+                artifact["decision"]["reasonCode"],
+                "curated_note_patch_policy_violation",
+            )
+            self.assertEqual(target_path.read_text(encoding="utf-8"), "# Project\n\nStatus: Draft\n")
+            quarantine_path = workspace / ".codex-supervisor" / "generated" / "obsidian" / "quarantine.json"
+            quarantine = json.loads(quarantine_path.read_text(encoding="utf-8"))
+            self.assertEqual(quarantine["decision"]["status"], "blocked")
+            self.assertEqual(
+                quarantine["patches"][0]["decision"]["reasonCode"],
+                "target_path_not_allowed",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
