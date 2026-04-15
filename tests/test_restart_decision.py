@@ -4,6 +4,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import automationplus.health_mirror as health_mirror
+import automationplus.loop_status as loop_status
 import automationplus.restart_decision as restart_decision
 
 
@@ -178,6 +180,81 @@ class RestartDecisionTests(unittest.TestCase):
             )
             self.assertEqual(block_artifact["artifactType"], "restart_control_block")
             self.assertEqual(block_artifact["route"], "quarantine")
+
+    def test_write_restart_decision_uses_persisted_failure_history_from_loop_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            supervisor_root = Path(tempdir) / "supervisor"
+            workspace_root = Path(tempdir) / "workspace"
+            decision_path = workspace_root / ".codex-supervisor" / "health" / "restart-decision.json"
+            budget_path = workspace_root / ".codex-supervisor" / "health" / "restart-budget.json"
+            health_snapshot_path = (
+                workspace_root / ".codex-supervisor" / "health" / "loop-health.json"
+            )
+            supervisor_root.mkdir(parents=True, exist_ok=True)
+            health_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+
+            runtime = {
+                "state": "running",
+                "hostMode": "tmux",
+                "sessionName": "automationplus-loop",
+                "windowName": "loop",
+                "paneId": "%1",
+                "panePid": 4242,
+                "paneCurrentCommand": "node",
+                "paneCurrentPath": str(supervisor_root),
+                "paneDead": True,
+                "tail": [
+                    "2026-04-15T09:10:00Z loop error: ECONNRESET while refreshing queue state",
+                ],
+            }
+            normalized = health_mirror._normalize_failure_text(runtime["tail"][0])
+            signature_id = health_mirror._signature_id("pane_dead", normalized)
+            health_snapshot_path.write_text(
+                (
+                    "{\n"
+                    '  "failureRegistry": {\n'
+                    '    "schemaVersion": 1,\n'
+                    '    "entries": {\n'
+                    f'      "{signature_id}": {{\n'
+                    f'        "id": "{signature_id}",\n'
+                    '        "reason": "pane_dead",\n'
+                    '        "signatureClass": "transient",\n'
+                    '        "summary": "2026-04-15T09:08:00Z loop error: ECONNRESET while refreshing queue state",\n'
+                    f'        "normalizedSummary": "{normalized}",\n'
+                    '        "firstSeenAt": "2026-04-15T09:08:01Z",\n'
+                    '        "lastSeenAt": "2026-04-15T09:08:01Z",\n'
+                    '        "seenCount": 1\n'
+                    "      }\n"
+                    "    }\n"
+                    "  }\n"
+                    "}\n"
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch(
+                "automationplus.loop_status.health_mirror._read_tmux_runtime",
+                return_value=runtime,
+            ):
+                loop_status_payload = loop_status.collect_loop_status(
+                    supervisor_root=supervisor_root,
+                    workspace_root=workspace_root,
+                )
+
+            artifact = restart_decision.write_restart_decision_artifact(
+                output_path=decision_path,
+                budget_path=budget_path,
+                loop_status_payload=loop_status_payload,
+                evaluated_at="2026-04-15T09:10:05Z",
+                max_restarts=2,
+                window_seconds=900,
+            )
+
+        self.assertEqual(loop_status_payload["failurePolicy"]["degradedState"], "repeated-failure")
+        self.assertEqual(loop_status_payload["failurePolicy"]["signature"]["count"], 2)
+        self.assertFalse(artifact["decision"]["allowed"])
+        self.assertEqual(artifact["decision"]["reasonCode"], "repeated_failure_auto_stop")
+        self.assertEqual(artifact["blocking"]["signatureId"], signature_id)
 
     def test_write_restart_decision_restart_not_eligible_includes_blocking_without_sidecar(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:

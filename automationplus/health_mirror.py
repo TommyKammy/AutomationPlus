@@ -432,6 +432,15 @@ def collect_loop_health_snapshot(
     return snapshot
 
 
+def apply_persisted_failure_tracking(snapshot: dict, artifact_path: Path) -> dict:
+    snapshot["failureRegistry"] = _merge_failure_registry(
+        _read_failure_registry(Path(artifact_path)),
+        snapshot,
+    )
+    snapshot["failurePolicy"] = _failure_policy(snapshot, snapshot["failureRegistry"])
+    return snapshot
+
+
 def write_loop_health_snapshot(
     output_path: Path,
     supervisor_root: Path,
@@ -445,11 +454,7 @@ def write_loop_health_snapshot(
         capture_lines=capture_lines,
         captured_at=captured_at,
     )
-    snapshot["failureRegistry"] = _merge_failure_registry(
-        _read_failure_registry(Path(output_path)),
-        snapshot,
-    )
-    snapshot["failurePolicy"] = _failure_policy(snapshot, snapshot["failureRegistry"])
+    snapshot = apply_persisted_failure_tracking(snapshot, output_path)
 
     output_path = Path(output_path).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)

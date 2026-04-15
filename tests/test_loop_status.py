@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import automationplus.health_mirror as health_mirror
 import automationplus.loop_status as loop_status
 
 
@@ -55,6 +56,9 @@ class LoopStatusTests(unittest.TestCase):
                         "signature": None,
                     },
                 },
+            ), mock.patch(
+                "automationplus.loop_status.health_mirror.apply_persisted_failure_tracking",
+                side_effect=lambda snapshot, _artifact_path: snapshot,
             ):
                 payload = loop_status.collect_loop_status(
                     supervisor_root=supervisor_root,
@@ -114,6 +118,9 @@ class LoopStatusTests(unittest.TestCase):
                         "signature": None,
                     },
                 },
+            ), mock.patch(
+                "automationplus.loop_status.health_mirror.apply_persisted_failure_tracking",
+                side_effect=lambda snapshot, _artifact_path: snapshot,
             ):
                 payload = loop_status.collect_loop_status(
                     supervisor_root=supervisor_root,
@@ -182,6 +189,9 @@ class LoopStatusTests(unittest.TestCase):
                         },
                     },
                 },
+            ), mock.patch(
+                "automationplus.loop_status.health_mirror.apply_persisted_failure_tracking",
+                side_effect=lambda snapshot, _artifact_path: snapshot,
             ):
                 payload = loop_status.collect_loop_status(
                     supervisor_root=supervisor_root,
@@ -192,6 +202,132 @@ class LoopStatusTests(unittest.TestCase):
         self.assertEqual(payload["runtime"]["health"], "degraded")
         self.assertEqual(payload["failurePolicy"]["degradedState"], "repeated-failure")
         self.assertTrue(payload["failurePolicy"]["operatorHold"])
+
+    def test_collect_loop_status_reuses_persisted_failure_registry_across_observations(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            supervisor_root = Path(tempdir) / "supervisor"
+            workspace_root = Path(tempdir) / "workspace"
+            output_path = (
+                workspace_root / ".codex-supervisor" / "health" / "loop-health.json"
+            )
+            supervisor_root.mkdir(parents=True, exist_ok=True)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+
+            runtime = {
+                "state": "running",
+                "hostMode": "tmux",
+                "sessionName": "automationplus-loop",
+                "windowName": "loop",
+                "paneId": "%1",
+                "panePid": 4242,
+                "paneCurrentCommand": "node",
+                "paneCurrentPath": str(supervisor_root),
+                "paneDead": True,
+                "tail": [
+                    "2026-04-15T00:05:59Z loop error: ECONNRESET while refreshing queue state",
+                ],
+            }
+            normalized = health_mirror._normalize_failure_text(runtime["tail"][0])
+            signature_id = health_mirror._signature_id("pane_dead", normalized)
+            output_path.write_text(
+                (
+                    "{\n"
+                    '  "failureRegistry": {\n'
+                    '    "schemaVersion": 1,\n'
+                    '    "entries": {\n'
+                    f'      "{signature_id}": {{\n'
+                    f'        "id": "{signature_id}",\n'
+                    '        "reason": "pane_dead",\n'
+                    '        "signatureClass": "transient",\n'
+                    '        "summary": "2026-04-15T00:03:00Z loop error: ECONNRESET while refreshing queue state",\n'
+                    f'        "normalizedSummary": "{normalized}",\n'
+                    '        "firstSeenAt": "2026-04-15T00:03:01Z",\n'
+                    '        "lastSeenAt": "2026-04-15T00:03:01Z",\n'
+                    '        "seenCount": 1\n'
+                    "      }\n"
+                    "    }\n"
+                    "  }\n"
+                    "}\n"
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch(
+                "automationplus.loop_status.health_mirror._read_tmux_runtime",
+                return_value=runtime,
+            ):
+                payload = loop_status.collect_loop_status(
+                    supervisor_root=supervisor_root,
+                    workspace_root=workspace_root,
+                )
+
+        self.assertEqual(payload["failurePolicy"]["degradedState"], "repeated-failure")
+        self.assertEqual(payload["failurePolicy"]["signature"]["id"], signature_id)
+        self.assertEqual(payload["failurePolicy"]["signature"]["count"], 2)
+        self.assertTrue(payload["failurePolicy"]["operatorHold"])
+
+    def test_collect_loop_status_applies_persisted_failure_tracking_on_health_mirror_error(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            supervisor_root = Path(tempdir) / "supervisor"
+            workspace_root = Path(tempdir) / "workspace"
+            expected_snapshot_path = (
+                workspace_root / ".codex-supervisor" / "health" / "loop-health.json"
+            ).resolve()
+            supervisor_root.mkdir(parents=True, exist_ok=True)
+            workspace_root.mkdir(parents=True, exist_ok=True)
+
+            persisted_snapshot = {
+                "schemaVersion": 1,
+                "degradedState": "repeated-failure",
+                "restartEligible": False,
+                "operatorHold": True,
+                "summary": "Persisted failure history was reused.",
+                "signature": {
+                    "id": "sig-persisted",
+                    "reason": "pane_dead",
+                    "class": "transient",
+                    "count": 2,
+                    "firstSeenAt": "2026-04-15T00:03:01Z",
+                    "lastSeenAt": "2026-04-15T00:06:01Z",
+                    "normalizedSummary": "loop error: econnreset while refreshing queue state",
+                },
+            }
+
+            def apply_tracking(snapshot: dict, artifact_path: Path) -> dict:
+                self.assertEqual(artifact_path, expected_snapshot_path)
+                self.assertEqual(snapshot["loopRuntime"]["state"], "unknown")
+                snapshot["failurePolicy"] = persisted_snapshot
+                snapshot["failureRegistry"] = {
+                    "schemaVersion": 1,
+                    "entries": {
+                        "sig-persisted": {
+                            "id": "sig-persisted",
+                            "seenCount": 2,
+                        }
+                    },
+                }
+                return snapshot
+
+            with mock.patch(
+                "automationplus.loop_status.health_mirror.collect_loop_health_snapshot",
+                side_effect=health_mirror.HealthMirrorError("tmux is not available on PATH"),
+            ), mock.patch(
+                "automationplus.loop_status.health_mirror.apply_persisted_failure_tracking",
+                side_effect=apply_tracking,
+            ) as apply_mock:
+                payload = loop_status.collect_loop_status(
+                    supervisor_root=supervisor_root,
+                    workspace_root=workspace_root,
+                )
+
+        apply_mock.assert_called_once()
+        self.assertEqual(payload["status"], "unknown")
+        self.assertEqual(payload["runtime"]["state"], "unknown")
+        self.assertEqual(payload["failurePolicy"], persisted_snapshot)
+        self.assertEqual(payload["observationError"]["code"], "health_mirror_error")
+        self.assertIn("tmux is not available", payload["observationError"]["message"])
 
 
 if __name__ == "__main__":
