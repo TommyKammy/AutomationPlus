@@ -715,3 +715,223 @@ def write_roadmap_proposal_pack(
 
     temp_path.replace(output_path)
     return proposal_pack
+
+
+def _validate_planning_item(
+    index: int,
+    plan_item: Any,
+    *,
+    proposal_keys: set[str],
+) -> dict[str, Any]:
+    if not isinstance(plan_item, dict):
+        raise ValueError(f"plan_items[{index}] must be an object")
+
+    required_fields = [
+        "itemKey",
+        "proposalKey",
+        "phase",
+        "title",
+        "summary",
+        "dependsOn",
+    ]
+    missing_fields = [field for field in required_fields if field not in plan_item]
+    if missing_fields:
+        raise ValueError(
+            f"plan_items[{index}] missing required fields: {', '.join(missing_fields)}"
+        )
+
+    normalized: dict[str, Any] = {}
+    for field_name in ("itemKey", "proposalKey", "phase", "title", "summary"):
+        raw_value = plan_item.get(field_name)
+        if not isinstance(raw_value, str) or not raw_value.strip():
+            raise ValueError(
+                f"plan_items[{index}].{field_name} must be a non-empty string"
+            )
+        normalized[field_name] = raw_value.strip()
+
+    if normalized["proposalKey"] not in proposal_keys:
+        raise ValueError(
+            f"plan_items[{index}].proposalKey references unknown proposalKey: {normalized['proposalKey']}"
+        )
+
+    normalized_depends_on = _normalized_string_list(plan_item.get("dependsOn"))
+    if normalized_depends_on is None:
+        raise ValueError(
+            f"plan_items[{index}].dependsOn must be a list of non-empty strings"
+        )
+    normalized["dependsOn"] = normalized_depends_on
+
+    return normalized
+
+
+def _topological_execution_order(plan_items: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
+    item_keys = [item["itemKey"] for item in plan_items]
+    known_keys = set(item_keys)
+    dependency_counts: dict[str, int] = {}
+    dependents: dict[str, list[str]] = {item_key: [] for item_key in item_keys}
+    roots: list[str] = []
+
+    for index, item in enumerate(plan_items):
+        item_key = item["itemKey"]
+        dependencies = item["dependsOn"]
+        dependency_counts[item_key] = len(dependencies)
+
+        for dependency_key in dependencies:
+            if dependency_key not in known_keys:
+                raise ValueError(
+                    f"plan_items[{index}] dependsOn references unknown itemKey: {dependency_key}"
+                )
+            if dependency_key == item_key:
+                raise ValueError(
+                    f"plan_items[{index}] dependsOn cannot reference its own itemKey: {item_key}"
+                )
+            dependents[dependency_key].append(item_key)
+
+        if not dependencies:
+            roots.append(item_key)
+
+    ready = list(roots)
+    execution_order: list[str] = []
+
+    while ready:
+        current = ready.pop(0)
+        execution_order.append(current)
+
+        for dependent_key in dependents[current]:
+            dependency_counts[dependent_key] -= 1
+            if dependency_counts[dependent_key] == 0:
+                ready.append(dependent_key)
+
+    if len(execution_order) != len(plan_items):
+        raise ValueError("planning DAG contains a cycle")
+
+    return roots, execution_order
+
+
+def build_planning_pack(
+    proposal_pack: dict[str, Any],
+    *,
+    plan_items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not isinstance(plan_items, list):
+        raise ValueError("plan_items must be a list of plan item objects")
+
+    proposals = proposal_pack.get("proposals")
+    if not isinstance(proposals, list):
+        proposals = []
+
+    proposal_keys = {
+        proposal.get("proposalKey")
+        for proposal in proposals
+        if isinstance(proposal, dict) and isinstance(proposal.get("proposalKey"), str)
+    }
+    validated_plan_items = [
+        _validate_planning_item(index, plan_item, proposal_keys=proposal_keys)
+        for index, plan_item in enumerate(plan_items)
+    ]
+
+    seen_item_keys: set[str] = set()
+    for index, item in enumerate(validated_plan_items):
+        item_key = item["itemKey"]
+        if item_key in seen_item_keys:
+            raise ValueError(f"plan_items[{index}].itemKey must be unique: {item_key}")
+        seen_item_keys.add(item_key)
+
+    roots, execution_order = _topological_execution_order(validated_plan_items)
+    execution_index_by_key = {
+        item_key: execution_index for execution_index, item_key in enumerate(execution_order)
+    }
+    item_by_key = {item["itemKey"]: item for item in validated_plan_items}
+
+    ordered_plan_items = []
+    for item_key in execution_order:
+        item = copy.deepcopy(item_by_key[item_key])
+        item["executionIndex"] = execution_index_by_key[item_key]
+        ordered_plan_items.append(item)
+
+    phases: list[dict[str, Any]] = []
+    for item_key in execution_order:
+        item = item_by_key[item_key]
+        phase_name = item["phase"]
+        if phases and phases[-1]["phase"] == phase_name:
+            phases[-1]["itemKeys"].append(item_key)
+            continue
+
+        depends_on_phases: list[str] = []
+        for dependency_key in item["dependsOn"]:
+            dependency_phase = item_by_key[dependency_key]["phase"]
+            if dependency_phase != phase_name and dependency_phase not in depends_on_phases:
+                depends_on_phases.append(dependency_phase)
+
+        phases.append(
+            {
+                "phase": phase_name,
+                "itemKeys": [item_key],
+                "dependsOnPhases": depends_on_phases,
+            }
+        )
+
+    source_artifact = proposal_pack.get("sourceArtifact")
+    if not isinstance(source_artifact, dict):
+        source_artifact = {}
+
+    source_evaluation = source_artifact.get("evaluation")
+    if not isinstance(source_evaluation, dict):
+        source_evaluation = {}
+
+    source_target = source_artifact.get("target")
+    if not isinstance(source_target, dict):
+        source_target = {}
+
+    return {
+        "schemaVersion": 1,
+        "artifactType": "planning_pack",
+        "generatedAt": proposal_pack.get("generatedAt"),
+        "sourceArtifact": {
+            "artifactType": proposal_pack.get("artifactType"),
+            "generatedAt": proposal_pack.get("generatedAt"),
+            "evaluation": copy.deepcopy(source_evaluation),
+            "target": copy.deepcopy(source_target),
+        },
+        "continuityContext": copy.deepcopy(proposal_pack.get("continuityContext", {})),
+        "proposals": copy.deepcopy(proposals),
+        "planItems": ordered_plan_items,
+        "graph": {
+            "roots": roots,
+            "executionOrder": execution_order,
+        },
+        "phases": phases,
+        "summary": {
+            "proposalCount": len(proposals),
+            "itemCount": len(ordered_plan_items),
+            "phaseCount": len(phases),
+            "rootCount": len(roots),
+        },
+    }
+
+
+def write_planning_pack(
+    output_path: Path,
+    proposal_pack: dict[str, Any],
+    *,
+    plan_items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    planning_pack = build_planning_pack(
+        proposal_pack,
+        plan_items=plan_items,
+    )
+    output_path = Path(output_path).resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=str(output_path.parent),
+        delete=False,
+    ) as handle:
+        json.dump(planning_pack, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        temp_path = Path(handle.name)
+
+    temp_path.replace(output_path)
+    return planning_pack
