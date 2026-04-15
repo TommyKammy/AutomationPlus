@@ -31,6 +31,16 @@ class RestartBudgetStateTests(unittest.TestCase):
         self.assertFalse(result["trusted"])
         self.assertEqual(result["error"]["code"], "schema_mismatch")
 
+    def test_read_budget_state_rejects_non_utf8_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            budget_path = Path(tempdir) / "restart-budget.json"
+            budget_path.write_bytes(b"\xff\xfe\x80")
+
+            result = restart_decision._read_budget_state(budget_path, expect_present=False)
+
+        self.assertFalse(result["trusted"])
+        self.assertEqual(result["error"]["code"], "read_failed")
+
     def test_read_budget_state_rejects_missing_file_when_expected(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             budget_path = Path(tempdir) / "restart-budget.json"

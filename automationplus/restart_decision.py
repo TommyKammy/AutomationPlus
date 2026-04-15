@@ -93,7 +93,7 @@ def _read_budget_state(path: Path, *, expect_present: bool) -> dict:
                 ),
             )
         return _budget_state_result(trusted=True, state=_empty_budget_state())
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         return _budget_state_result(
             trusted=False,
             state=None,
@@ -278,7 +278,7 @@ def _blocking_details(
     summary: Optional[str],
     signature: Optional[dict],
     budget_state_error: Optional[dict],
-    used_before_decision: int,
+    used_before_decision: Optional[int],
     max_restarts: int,
     window_seconds: int,
 ) -> Optional[dict]:
@@ -385,7 +385,9 @@ def build_restart_decision_artifact(
         history = []
 
     history = _prune_history(history, evaluated_at=evaluated_at, window_seconds=window_seconds)
-    used_before_decision = _allowed_restart_count(history)
+    used_before_decision = (
+        _allowed_restart_count(history) if budget_state_trusted else None
+    )
     decision_outcome = _decision_outcome(loop_status_payload)
     reason_code = decision_outcome["reasonCode"]
     action = decision_outcome["action"]
@@ -396,7 +398,11 @@ def build_restart_decision_artifact(
         action = "hold"
         route = "hold"
 
-    if reason_code == "transient_restart_allowed" and used_before_decision >= max_restarts:
+    if (
+        reason_code == "transient_restart_allowed"
+        and isinstance(used_before_decision, int)
+        and used_before_decision >= max_restarts
+    ):
         reason_code = "restart_budget_exhausted"
         action = "stop"
         route = "quarantine"
