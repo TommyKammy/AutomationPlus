@@ -64,41 +64,130 @@ def _empty_budget_state() -> dict:
     }
 
 
-def _read_budget_state(path: Path) -> dict:
+def _budget_state_error(*, code: str, summary: str) -> dict:
+    return {
+        "code": code,
+        "summary": summary,
+    }
+
+
+def _budget_state_result(*, trusted: bool, state: Optional[dict], error: Optional[dict] = None) -> dict:
+    return {
+        "trusted": trusted,
+        "state": state,
+        "error": error,
+    }
+
+
+def _read_budget_state(path: Path, *, expect_present: bool) -> dict:
     try:
         raw = Path(path).read_text(encoding="utf-8")
     except FileNotFoundError:
-        return _empty_budget_state()
+        if expect_present:
+            return _budget_state_result(
+                trusted=False,
+                state=None,
+                error=_budget_state_error(
+                    code="missing_expected",
+                    summary="Restart budget state is missing but a prior decision artifact indicates it should exist.",
+                ),
+            )
+        return _budget_state_result(trusted=True, state=_empty_budget_state())
+    except (OSError, UnicodeDecodeError) as exc:
+        return _budget_state_result(
+            trusted=False,
+            state=None,
+            error=_budget_state_error(
+                code="read_failed",
+                summary=f"Restart budget state could not be read: {exc}",
+            ),
+        )
 
     if not raw.strip():
-        return _empty_budget_state()
+        return _budget_state_result(
+            trusted=False,
+            state=None,
+            error=_budget_state_error(
+                code="empty_file",
+                summary="Restart budget state file is empty.",
+            ),
+        )
 
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError:
-        return _empty_budget_state()
+        return _budget_state_result(
+            trusted=False,
+            state=None,
+            error=_budget_state_error(
+                code="invalid_json",
+                summary="Restart budget state is not valid JSON.",
+            ),
+        )
 
     if not isinstance(payload, dict):
-        return _empty_budget_state()
+        return _budget_state_result(
+            trusted=False,
+            state=None,
+            error=_budget_state_error(
+                code="invalid_root",
+                summary="Restart budget state root must be a JSON object.",
+            ),
+        )
     if payload.get("schemaVersion") != RESTART_BUDGET_SCHEMA_VERSION:
-        return _empty_budget_state()
+        return _budget_state_result(
+            trusted=False,
+            state=None,
+            error=_budget_state_error(
+                code="schema_mismatch",
+                summary="Restart budget state schema version is unsupported.",
+            ),
+        )
 
     history = payload.get("history")
     if not isinstance(history, list):
-        return _empty_budget_state()
+        return _budget_state_result(
+            trusted=False,
+            state=None,
+            error=_budget_state_error(
+                code="invalid_history",
+                summary="Restart budget state history must be an array.",
+            ),
+        )
 
     sanitized_history: List[dict] = []
     for item in history:
         if not isinstance(item, dict):
-            continue
+            return _budget_state_result(
+                trusted=False,
+                state=None,
+                error=_budget_state_error(
+                    code="invalid_history_entry",
+                    summary="Restart budget state history contains a non-object entry.",
+                ),
+            )
         evaluated_at = item.get("evaluatedAt")
         allowed = item.get("allowed")
         if not isinstance(evaluated_at, str) or not isinstance(allowed, bool):
-            continue
+            return _budget_state_result(
+                trusted=False,
+                state=None,
+                error=_budget_state_error(
+                    code="invalid_history_entry",
+                    summary="Restart budget state history contains an entry with invalid fields.",
+                ),
+            )
         try:
             _parse_iso8601(evaluated_at)
         except ValueError:
-            continue
+            return _budget_state_result(
+                trusted=False,
+                state=None,
+                error=_budget_state_error(
+                    code="invalid_history_entry",
+                    summary="Restart budget state history contains an invalid timestamp.",
+                ),
+            )
         sanitized_history.append(
             {
                 "evaluatedAt": evaluated_at,
@@ -108,10 +197,13 @@ def _read_budget_state(path: Path) -> dict:
             }
         )
 
-    return {
-        "schemaVersion": RESTART_BUDGET_SCHEMA_VERSION,
-        "history": sanitized_history,
-    }
+    return _budget_state_result(
+        trusted=True,
+        state={
+            "schemaVersion": RESTART_BUDGET_SCHEMA_VERSION,
+            "history": sanitized_history,
+        },
+    )
 
 
 def _prune_history(history: List[dict], *, evaluated_at: str, window_seconds: int) -> List[dict]:
@@ -185,7 +277,8 @@ def _blocking_details(
     route: Optional[str],
     summary: Optional[str],
     signature: Optional[dict],
-    used_before_decision: int,
+    budget_state_error: Optional[dict],
+    used_before_decision: Optional[int],
     max_restarts: int,
     window_seconds: int,
 ) -> Optional[dict]:
@@ -233,6 +326,14 @@ def _blocking_details(
             "Review the current failure classification and restart eligibility "
             "before resuming service."
         )
+    elif reason_code == "restart_budget_state_untrusted":
+        blocking_summary = (
+            "Automation refused an unattended restart because the persisted "
+            "restart budget state cannot be trusted."
+        )
+        resume_hint = (
+            "Repair or replace the restart budget artifact before resuming unattended recovery."
+        )
     else:
         blocking_summary = (
             "Automation refused to continue unattended recovery and is waiting "
@@ -254,6 +355,7 @@ def _blocking_details(
         "windowSeconds": window_seconds,
         "requiresOperatorAction": True,
         "resumeHint": resume_hint,
+        "budgetStateError": budget_state_error,
     }
 
 
@@ -266,6 +368,8 @@ def build_restart_decision_artifact(
     *,
     loop_status_payload: dict,
     budget_state: Optional[dict] = None,
+    budget_state_trusted: bool = True,
+    budget_state_error: Optional[dict] = None,
     evaluated_at: Optional[str] = None,
     max_restarts: int = DEFAULT_MAX_RESTARTS,
     window_seconds: int = DEFAULT_WINDOW_SECONDS,
@@ -281,13 +385,24 @@ def build_restart_decision_artifact(
         history = []
 
     history = _prune_history(history, evaluated_at=evaluated_at, window_seconds=window_seconds)
-    used_before_decision = _allowed_restart_count(history)
+    used_before_decision = (
+        _allowed_restart_count(history) if budget_state_trusted else None
+    )
     decision_outcome = _decision_outcome(loop_status_payload)
     reason_code = decision_outcome["reasonCode"]
     action = decision_outcome["action"]
     route = decision_outcome["route"]
 
-    if reason_code == "transient_restart_allowed" and used_before_decision >= max_restarts:
+    if not budget_state_trusted:
+        reason_code = "restart_budget_state_untrusted"
+        action = "hold"
+        route = "hold"
+
+    if (
+        reason_code == "transient_restart_allowed"
+        and isinstance(used_before_decision, int)
+        and used_before_decision >= max_restarts
+    ):
         reason_code = "restart_budget_exhausted"
         action = "stop"
         route = "quarantine"
@@ -304,6 +419,7 @@ def build_restart_decision_artifact(
         route=route,
         summary=summary,
         signature=signature if isinstance(signature, dict) else None,
+        budget_state_error=budget_state_error if isinstance(budget_state_error, dict) else None,
         used_before_decision=used_before_decision,
         max_restarts=max_restarts,
         window_seconds=window_seconds,
@@ -319,14 +435,17 @@ def build_restart_decision_artifact(
     if allowed:
         next_history.append(decision_entry)
 
-    used_after_decision = _allowed_restart_count(next_history)
-    remaining = max(max_restarts - used_after_decision, 0)
+    used_after_decision = _allowed_restart_count(next_history) if budget_state_trusted else None
+    remaining = max(max_restarts - used_after_decision, 0) if isinstance(used_after_decision, int) else None
     budget = {
         "maxRestarts": max_restarts,
         "windowSeconds": window_seconds,
         "used": used_after_decision,
         "remaining": remaining,
+        "stateTrusted": budget_state_trusted,
     }
+    if isinstance(budget_state_error, dict):
+        budget["stateError"] = budget_state_error
 
     artifact = {
         "schemaVersion": RESTART_DECISION_SCHEMA_VERSION,
@@ -382,20 +501,25 @@ def write_restart_decision_artifact(
 ) -> dict:
     budget_path = Path(budget_path).resolve()
     output_path = Path(output_path).resolve()
-    budget_state = _read_budget_state(budget_path)
+    expect_budget_state = output_path.exists()
+    budget_state_result = _read_budget_state(budget_path, expect_present=expect_budget_state)
+    budget_state = budget_state_result.get("state")
     artifact, next_budget_state = build_restart_decision_artifact(
         loop_status_payload=loop_status_payload,
         budget_state=budget_state,
+        budget_state_trusted=budget_state_result.get("trusted") is True,
+        budget_state_error=budget_state_result.get("error"),
         evaluated_at=evaluated_at,
         max_restarts=max_restarts,
         window_seconds=window_seconds,
     )
-    _write_json_atomic(budget_path, next_budget_state)
     block_artifact_path = _restart_control_block_path(output_path)
     blocking = artifact.get("blocking")
     routed_blocking = (
         blocking if isinstance(blocking, dict) and blocking.get("route") is not None else None
     )
+    if budget_state_result.get("trusted") is True:
+        _write_json_atomic(budget_path, next_budget_state)
     if isinstance(routed_blocking, dict):
         artifact["blockArtifactPath"] = str(block_artifact_path)
         block_artifact = {

@@ -121,6 +121,140 @@ class RestartDecisionTests(unittest.TestCase):
             self.assertEqual(artifact["budget"]["used"], 2)
             self.assertEqual(artifact["budget"]["remaining"], 0)
 
+    def test_write_restart_decision_blocks_when_budget_state_json_is_corrupt(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            decision_path = root / ".codex-supervisor" / "health" / "restart-decision.json"
+            budget_path = root / ".codex-supervisor" / "health" / "restart-budget.json"
+            budget_path.parent.mkdir(parents=True, exist_ok=True)
+            corrupt_payload = '{"schemaVersion": 1, "history": ['
+            budget_path.write_text(corrupt_payload, encoding="utf-8")
+
+            artifact = restart_decision.write_restart_decision_artifact(
+                output_path=decision_path,
+                budget_path=budget_path,
+                loop_status_payload=self._loop_status_payload(
+                    degraded_state="transient-failure",
+                    restart_eligible=True,
+                    operator_hold=False,
+                ),
+                evaluated_at="2026-04-15T09:10:05Z",
+                max_restarts=2,
+                window_seconds=900,
+            )
+
+            self.assertFalse(artifact["decision"]["allowed"])
+            self.assertEqual(artifact["decision"]["reasonCode"], "restart_budget_state_untrusted")
+            self.assertEqual(artifact["decision"]["action"], "hold")
+            self.assertEqual(artifact["blocking"]["route"], "hold")
+            self.assertEqual(artifact["blocking"]["budgetStateError"]["code"], "invalid_json")
+            self.assertEqual(artifact["blocking"]["usedRestartsBeforeDecision"], None)
+            self.assertEqual(budget_path.read_text(encoding="utf-8"), corrupt_payload)
+
+    def test_write_restart_decision_blocks_when_budget_state_schema_is_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            decision_path = root / ".codex-supervisor" / "health" / "restart-decision.json"
+            budget_path = root / ".codex-supervisor" / "health" / "restart-budget.json"
+            budget_path.parent.mkdir(parents=True, exist_ok=True)
+            budget_path.write_text(
+                json.dumps({"schemaVersion": 99, "history": []}),
+                encoding="utf-8",
+            )
+
+            artifact = restart_decision.write_restart_decision_artifact(
+                output_path=decision_path,
+                budget_path=budget_path,
+                loop_status_payload=self._loop_status_payload(
+                    degraded_state="transient-failure",
+                    restart_eligible=True,
+                    operator_hold=False,
+                ),
+                evaluated_at="2026-04-15T09:10:05Z",
+                max_restarts=2,
+                window_seconds=900,
+            )
+
+            self.assertFalse(artifact["decision"]["allowed"])
+            self.assertEqual(artifact["blocking"]["budgetStateError"]["code"], "schema_mismatch")
+            self.assertEqual(artifact["budget"]["stateTrusted"], False)
+
+    def test_write_restart_decision_blocks_when_budget_state_is_unreadable(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            decision_path = root / ".codex-supervisor" / "health" / "restart-decision.json"
+            budget_path = root / ".codex-supervisor" / "health" / "restart-budget.json"
+
+            with mock.patch("pathlib.Path.read_text", side_effect=PermissionError("permission denied")):
+                artifact = restart_decision.write_restart_decision_artifact(
+                    output_path=decision_path,
+                    budget_path=budget_path,
+                    loop_status_payload=self._loop_status_payload(
+                        degraded_state="transient-failure",
+                        restart_eligible=True,
+                        operator_hold=False,
+                    ),
+                    evaluated_at="2026-04-15T09:10:05Z",
+                    max_restarts=2,
+                    window_seconds=900,
+                )
+
+            self.assertFalse(artifact["decision"]["allowed"])
+            self.assertEqual(artifact["blocking"]["budgetStateError"]["code"], "read_failed")
+            self.assertEqual(artifact["budget"]["used"], None)
+            self.assertEqual(artifact["blocking"]["usedRestartsBeforeDecision"], None)
+
+    def test_write_restart_decision_blocks_when_budget_state_has_invalid_utf8(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            decision_path = root / ".codex-supervisor" / "health" / "restart-decision.json"
+            budget_path = root / ".codex-supervisor" / "health" / "restart-budget.json"
+            budget_path.parent.mkdir(parents=True, exist_ok=True)
+            budget_path.write_bytes(b"\xff\xfe\x80")
+
+            artifact = restart_decision.write_restart_decision_artifact(
+                output_path=decision_path,
+                budget_path=budget_path,
+                loop_status_payload=self._loop_status_payload(
+                    degraded_state="transient-failure",
+                    restart_eligible=True,
+                    operator_hold=False,
+                ),
+                evaluated_at="2026-04-15T09:10:05Z",
+                max_restarts=2,
+                window_seconds=900,
+            )
+
+            self.assertFalse(artifact["decision"]["allowed"])
+            self.assertEqual(artifact["decision"]["reasonCode"], "restart_budget_state_untrusted")
+            self.assertEqual(artifact["blocking"]["budgetStateError"]["code"], "read_failed")
+            self.assertEqual(artifact["blocking"]["usedRestartsBeforeDecision"], None)
+
+    def test_write_restart_decision_blocks_when_budget_state_is_missing_after_prior_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            decision_path = root / ".codex-supervisor" / "health" / "restart-decision.json"
+            budget_path = root / ".codex-supervisor" / "health" / "restart-budget.json"
+            decision_path.parent.mkdir(parents=True, exist_ok=True)
+            decision_path.write_text('{"existing": true}\n', encoding="utf-8")
+
+            artifact = restart_decision.write_restart_decision_artifact(
+                output_path=decision_path,
+                budget_path=budget_path,
+                loop_status_payload=self._loop_status_payload(
+                    degraded_state="transient-failure",
+                    restart_eligible=True,
+                    operator_hold=False,
+                ),
+                evaluated_at="2026-04-15T09:10:05Z",
+                max_restarts=2,
+                window_seconds=900,
+            )
+
+            self.assertFalse(artifact["decision"]["allowed"])
+            self.assertEqual(artifact["blocking"]["budgetStateError"]["code"], "missing_expected")
+            self.assertEqual(artifact["decision"]["reasonCode"], "restart_budget_state_untrusted")
+
     def test_write_restart_decision_denies_unsafe_failure_classification(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
