@@ -154,6 +154,10 @@ def collect_loop_status(
                 "stateMatches": None,
             },
         }
+        snapshot = health_mirror.apply_persisted_failure_tracking(
+            snapshot,
+            health_snapshot_path,
+        )
         observation_error = {"code": "health_mirror_error", "message": str(exc)}
 
     loop_runtime = snapshot.get("loopRuntime", {})
