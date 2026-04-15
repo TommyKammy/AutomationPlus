@@ -51,6 +51,26 @@ class ObsidianGeneratedSyncTests(unittest.TestCase):
                 ],
             )
 
+    def test_generated_sync_anchors_relative_output_paths_to_vault_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            workspace = Path(tempdir)
+            relative_output_path = Path("obsidian") / "generated" / "daily" / "summary.md"
+            expected_output_path = workspace / relative_output_path
+
+            artifact = obsidian_sync.write_generated_note_sync(
+                workspace_root=workspace,
+                vault_root=workspace,
+                output_path=relative_output_path,
+                content="# Daily Summary\n\nGenerated content.\n",
+                loop_status_payload=self._healthy_loop_status(),
+                generated_at="2026-04-15T10:00:00Z",
+            )
+
+            self.assertEqual(artifact["decision"]["status"], "written")
+            self.assertEqual(expected_output_path.read_text(encoding="utf-8"), "# Daily Summary\n\nGenerated content.\n")
+            self.assertEqual(artifact["requestedPath"], "obsidian/generated/daily/summary.md")
+            self.assertEqual(artifact["paths"]["outputPath"], str(expected_output_path.resolve()))
+
     def test_generated_sync_blocks_paths_outside_generated_policy(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             workspace = Path(tempdir)

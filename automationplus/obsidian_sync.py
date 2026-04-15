@@ -189,7 +189,10 @@ def write_generated_note_sync(
 ) -> dict[str, Any]:
     workspace_root = Path(workspace_root).resolve()
     vault_root = Path(vault_root).resolve()
-    output_path = Path(output_path).resolve()
+    output_path = Path(output_path)
+    if not output_path.is_absolute():
+        output_path = vault_root / output_path
+    output_path = output_path.resolve()
     quarantine_path = (workspace_root / DEFAULT_QUARANTINE_RELATIVE_PATH).resolve()
 
     artifact = _base_artifact(
