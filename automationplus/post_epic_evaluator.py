@@ -850,26 +850,29 @@ def build_planning_pack(
         ordered_plan_items.append(item)
 
     phases: list[dict[str, Any]] = []
+    phase_by_name: dict[str, dict[str, Any]] = {}
     for item_key in execution_order:
         item = item_by_key[item_key]
         phase_name = item["phase"]
-        if phases and phases[-1]["phase"] == phase_name:
-            phases[-1]["itemKeys"].append(item_key)
-            continue
+        phase_entry = phase_by_name.get(phase_name)
+        if phase_entry is None:
+            phase_entry = {
+                "phase": phase_name,
+                "itemKeys": [],
+                "dependsOnPhases": [],
+            }
+            phase_by_name[phase_name] = phase_entry
+            phases.append(phase_entry)
 
-        depends_on_phases: list[str] = []
+        phase_entry["itemKeys"].append(item_key)
+
         for dependency_key in item["dependsOn"]:
             dependency_phase = item_by_key[dependency_key]["phase"]
-            if dependency_phase != phase_name and dependency_phase not in depends_on_phases:
-                depends_on_phases.append(dependency_phase)
-
-        phases.append(
-            {
-                "phase": phase_name,
-                "itemKeys": [item_key],
-                "dependsOnPhases": depends_on_phases,
-            }
-        )
+            if (
+                dependency_phase != phase_name
+                and dependency_phase not in phase_entry["dependsOnPhases"]
+            ):
+                phase_entry["dependsOnPhases"].append(dependency_phase)
 
     source_artifact = proposal_pack.get("sourceArtifact")
     if not isinstance(source_artifact, dict):

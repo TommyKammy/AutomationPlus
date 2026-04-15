@@ -1085,6 +1085,78 @@ Parallelizable: No
         self.assertEqual(persisted, planning_pack)
         self.assertEqual(on_disk, planning_pack)
 
+    def test_planning_pack_merges_dependency_phases_across_multi_item_phase(self) -> None:
+        proposal_pack = {
+            "generatedAt": "2026-04-15T03:00:00Z",
+            "proposals": [
+                {
+                    "proposalKey": "phase-2-planning",
+                }
+            ],
+        }
+
+        planning_pack = build_planning_pack(
+            proposal_pack,
+            plan_items=[
+                {
+                    "itemKey": "capture-pack-shape",
+                    "proposalKey": "phase-2-planning",
+                    "phase": "design",
+                    "title": "Capture planning-pack shape",
+                    "summary": "Define the machine-readable planning artifact and source metadata.",
+                    "dependsOn": [],
+                },
+                {
+                    "itemKey": "validate-dag",
+                    "proposalKey": "phase-2-planning",
+                    "phase": "validation",
+                    "title": "Validate planning DAGs",
+                    "summary": "Reject cycles and malformed graphs.",
+                    "dependsOn": ["capture-pack-shape"],
+                },
+                {
+                    "itemKey": "draft-implementation-plan",
+                    "proposalKey": "phase-2-planning",
+                    "phase": "execution",
+                    "title": "Draft implementation plan",
+                    "summary": "Lay out execution after the initial design is ready.",
+                    "dependsOn": ["capture-pack-shape"],
+                },
+                {
+                    "itemKey": "persist-artifact",
+                    "proposalKey": "phase-2-planning",
+                    "phase": "execution",
+                    "title": "Persist planning pack artifact",
+                    "summary": "Persist the plan after validation passes.",
+                    "dependsOn": ["validate-dag"],
+                },
+            ],
+        )
+
+        self.assertEqual(
+            planning_pack["phases"],
+            [
+                {
+                    "phase": "design",
+                    "itemKeys": ["capture-pack-shape"],
+                    "dependsOnPhases": [],
+                },
+                {
+                    "phase": "validation",
+                    "itemKeys": ["validate-dag"],
+                    "dependsOnPhases": ["design"],
+                },
+                {
+                    "phase": "execution",
+                    "itemKeys": [
+                        "draft-implementation-plan",
+                        "persist-artifact",
+                    ],
+                    "dependsOnPhases": ["design", "validation"],
+                },
+            ],
+        )
+
     def test_planning_pack_rejects_missing_dependency_parent(self) -> None:
         job = PostEpicEvaluationJob(
             repository_full_name="TommyKammy/AutomationPlus",
