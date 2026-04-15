@@ -966,6 +966,394 @@ def write_planning_pack(
     return planning_pack
 
 
+def _roadmap_issue_set_blocking_details(issue_lint_result: dict[str, Any]) -> list[str]:
+    return _issue_lint_blocking_details(issue_lint_result)
+
+
+def _render_issue_set_issue_body(
+    *,
+    issue_type: str,
+    title: str,
+    summary: str,
+    scope: list[str],
+    acceptance_criteria: list[str],
+    verification: list[str],
+    part_of: str,
+    depends_on: list[str],
+    execution_order: str,
+) -> str:
+    depends_on_value = ", ".join(depends_on) if depends_on else "none"
+    return "\n".join(
+        [
+            "## Summary",
+            summary,
+            "",
+            "## Scope",
+            *[f"- {item}" for item in scope],
+            "",
+            "## Acceptance criteria",
+            *[f"- {item}" for item in acceptance_criteria],
+            "",
+            "## Verification",
+            *[f"- {item}" for item in verification],
+            "",
+            f"Part of: {part_of}",
+            f"Depends on: {depends_on_value}",
+            "Parallelizable: No",
+            "",
+            "## Execution order",
+            execution_order,
+        ]
+    )
+
+
+def _build_roadmap_continuity_roadmap_issue(
+    *,
+    epic_issue_number: Any,
+    epic_title: str,
+    proposals: list[dict[str, Any]],
+    issue_count: int,
+) -> dict[str, Any]:
+    title = f"Roadmap continuity for #{epic_issue_number} {epic_title}"
+    return {
+        "dedupeKey": f"roadmap-continuity:roadmap:{epic_issue_number}",
+        "title": title,
+        "body": _render_issue_set_issue_body(
+            issue_type="roadmap",
+            title=title,
+            summary=(
+                f"Publish a bounded roadmap continuity issue set for #{epic_issue_number} "
+                f"{epic_title}."
+            ),
+            scope=[
+                "promote only the explicitly approved roadmap continuity issues",
+                "keep roadmap continuity publication bounded to one roadmap issue, one Epic per proposal, and one child issue per planning item",
+                *[
+                    f"include proposal {proposal['proposalKey']}: {proposal['title']}"
+                    for proposal in proposals
+                ],
+            ],
+            acceptance_criteria=[
+                "the roadmap continuity issue set remains bounded and label-aware",
+                "all promoted issues preserve canonical codex metadata for later issue-lint and loop execution",
+                "issues without explicit publish approval stop at draft or quarantine instead of promoting",
+            ],
+            verification=[
+                "python3 -m unittest tests.test_post_epic_evaluator -v",
+                "review the generated roadmap, Epic, and child issue metadata for canonical scheduling fields",
+            ],
+            part_of=f"#{epic_issue_number}",
+            depends_on=[],
+            execution_order=f"1 of {issue_count}",
+        ),
+        "labels": ["codex", "roadmap-continuity", "roadmap"],
+        "state": "draft",
+        "canonicalMetadata": {
+            "issueType": "roadmap",
+            "partOf": f"#{epic_issue_number}",
+            "dependsOn": [],
+            "parallelizable": False,
+            "executionOrder": f"1 of {issue_count}",
+        },
+    }
+
+
+def _build_roadmap_continuity_epic_issue(
+    *,
+    epic_issue_number: Any,
+    proposal: dict[str, Any],
+    execution_order: str,
+) -> dict[str, Any]:
+    title = f"Epic: {proposal['title']}"
+    return {
+        "dedupeKey": (
+            f"roadmap-continuity:epic:{epic_issue_number}:{proposal['proposalKey']}"
+        ),
+        "title": title,
+        "body": _render_issue_set_issue_body(
+            issue_type="epic",
+            title=title,
+            summary=proposal["summary"],
+            scope=[
+                *proposal["goals"],
+                *proposal["constraints"],
+            ],
+            acceptance_criteria=[
+                "the Epic retains roadmap continuity labels and canonical metadata",
+                "the Epic only promotes when the continuity envelope and issue-lint both allow publication",
+                "the Epic remains bounded to child issues derived from the planning pack",
+            ],
+            verification=[
+                "python3 -m unittest tests.test_post_epic_evaluator -v",
+                "review the generated Epic issue body and canonical metadata",
+            ],
+            part_of="roadmap",
+            depends_on=[],
+            execution_order=execution_order,
+        ),
+        "labels": ["codex", "roadmap-continuity", "epic"],
+        "state": "draft",
+        "canonicalMetadata": {
+            "issueType": "epic",
+            "proposalKey": proposal["proposalKey"],
+            "partOf": "roadmap",
+            "dependsOn": [],
+            "parallelizable": False,
+            "executionOrder": execution_order,
+        },
+    }
+
+
+def _build_roadmap_continuity_child_issue(
+    *,
+    item: dict[str, Any],
+    execution_order: str,
+) -> dict[str, Any]:
+    depends_on = [f"child:{dependency_key}" for dependency_key in item["dependsOn"]]
+    return {
+        "dedupeKey": f"roadmap-continuity:child:{item['itemKey']}",
+        "title": item["title"],
+        "body": _render_issue_set_issue_body(
+            issue_type="child",
+            title=item["title"],
+            summary=item["summary"],
+            scope=[
+                f"deliver planning phase {item['phase']} for proposal {item['proposalKey']}",
+                "preserve canonical metadata for downstream issue-lint and loop execution",
+                "respect explicit publish gates from the continuity envelope and publish decisions",
+            ],
+            acceptance_criteria=[
+                "the child issue remains label-aware and bounded to the planning pack item",
+                "the child issue records canonical dependency metadata for loop-safe execution",
+                "the child issue only promotes when publish gates are explicitly satisfied",
+            ],
+            verification=[
+                "python3 -m unittest tests.test_post_epic_evaluator -v",
+                "review the generated child issue metadata and dependency chain",
+            ],
+            part_of=f"epic:{item['proposalKey']}",
+            depends_on=depends_on,
+            execution_order=execution_order,
+        ),
+        "labels": ["codex", "roadmap-continuity", "child"],
+        "state": "draft",
+        "canonicalMetadata": {
+            "issueType": "child",
+            "proposalKey": item["proposalKey"],
+            "itemKey": item["itemKey"],
+            "partOf": f"epic:{item['proposalKey']}",
+            "dependsOn": depends_on,
+            "parallelizable": False,
+            "executionOrder": execution_order,
+        },
+    }
+
+
+def build_roadmap_continuity_issue_set_publish_plan(
+    planning_pack: dict[str, Any],
+    *,
+    publish_decisions: dict[str, str],
+    issue_lint_results: Optional[dict[str, dict[str, Any]]] = None,
+    existing_draft_keys: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    issue_lint_results = issue_lint_results or {}
+    existing_draft_keys = existing_draft_keys or []
+
+    source_artifact = planning_pack.get("sourceArtifact")
+    if not isinstance(source_artifact, dict):
+        source_artifact = {}
+
+    evaluation = source_artifact.get("evaluation")
+    if not isinstance(evaluation, dict):
+        evaluation = {}
+    evaluation = copy.deepcopy(evaluation)
+
+    epic = evaluation.get("epic")
+    if not isinstance(epic, dict):
+        epic = {}
+    epic = copy.deepcopy(epic)
+
+    continuity_envelope = planning_pack.get("continuityEnvelope")
+    if not isinstance(continuity_envelope, dict):
+        continuity_envelope = {}
+
+    promotion_state = continuity_envelope.get("promotionState")
+
+    proposals = planning_pack.get("proposals")
+    if not isinstance(proposals, list):
+        proposals = []
+    proposals = [copy.deepcopy(proposal) for proposal in proposals if isinstance(proposal, dict)]
+
+    plan_items = planning_pack.get("planItems")
+    if not isinstance(plan_items, list):
+        plan_items = []
+    plan_items = [copy.deepcopy(item) for item in plan_items if isinstance(item, dict)]
+
+    total_issue_count = 1 + len(proposals) + len(plan_items)
+
+    issue_set: list[dict[str, Any]] = []
+    issue_set.append(
+        {
+            "publishKey": "roadmap",
+            "issueType": "roadmap",
+            "draftIssue": _build_roadmap_continuity_roadmap_issue(
+                epic_issue_number=epic.get("issueNumber"),
+                epic_title=epic.get("title", "Roadmap continuity"),
+                proposals=proposals,
+                issue_count=total_issue_count,
+            ),
+        }
+    )
+
+    for proposal_index, proposal in enumerate(proposals, start=2):
+        issue_set.append(
+            {
+                "publishKey": f"epic:{proposal['proposalKey']}",
+                "issueType": "epic",
+                "draftIssue": _build_roadmap_continuity_epic_issue(
+                    epic_issue_number=epic.get("issueNumber"),
+                    proposal=proposal,
+                    execution_order=f"{proposal_index} of {total_issue_count}",
+                ),
+            }
+        )
+
+    child_start_index = 1 + len(proposals)
+    for item_index, item in enumerate(plan_items, start=child_start_index + 1):
+        issue_set.append(
+            {
+                "publishKey": f"child:{item['itemKey']}",
+                "issueType": "child",
+                "draftIssue": _build_roadmap_continuity_child_issue(
+                    item=item,
+                    execution_order=f"{item_index} of {total_issue_count}",
+                ),
+            }
+        )
+
+    valid_decisions = {"publish", "draft", "quarantine"}
+    promoted_count = 0
+    draft_count = 0
+    quarantined_count = 0
+
+    for entry in issue_set:
+        publish_key = entry["publishKey"]
+        draft_issue = entry["draftIssue"]
+        decision = publish_decisions.get(publish_key, "draft")
+        if decision not in valid_decisions:
+            raise ValueError(
+                f"publish_decisions[{publish_key}] must be one of: draft, publish, quarantine"
+            )
+
+        dedupe_key = draft_issue["dedupeKey"]
+        if dedupe_key in existing_draft_keys:
+            entry["promotion"] = {"decision": "quarantine", "reason": "duplicate_draft"}
+            entry["quarantine"] = {
+                "reason": "duplicate_draft",
+                "blockingDetails": [
+                    f"draft already exists for dedupe key {dedupe_key}"
+                ],
+            }
+            quarantined_count += 1
+            continue
+
+        if promotion_state == "quarantined":
+            entry["promotion"] = {
+                "decision": "quarantine",
+                "reason": "continuity_envelope_quarantined",
+            }
+            entry["quarantine"] = {
+                "reason": "continuity_envelope_quarantined",
+                "blockingDetails": list(
+                    continuity_envelope.get("publishEligibility", {}).get("reasons", [])
+                )
+                or ["continuity envelope quarantined issue publication"],
+            }
+            quarantined_count += 1
+            continue
+
+        if promotion_state == "draft_only":
+            entry["promotion"] = {
+                "decision": "draft",
+                "reason": "continuity_envelope_draft_only",
+            }
+            draft_count += 1
+            continue
+
+        if decision == "quarantine":
+            entry["promotion"] = {"decision": "quarantine", "reason": "publish_withheld"}
+            entry["quarantine"] = {
+                "reason": "publish_withheld",
+                "blockingDetails": ["publish decision explicitly withheld promotion"],
+            }
+            quarantined_count += 1
+            continue
+
+        if decision == "draft":
+            entry["promotion"] = {"decision": "draft", "reason": "explicit_draft"}
+            draft_count += 1
+            continue
+
+        issue_lint_result = issue_lint_results.get(publish_key)
+        if issue_lint_result is None:
+            entry["promotion"] = {"decision": "quarantine", "reason": "issue_lint_missing"}
+            entry["quarantine"] = {
+                "reason": "issue_lint_missing",
+                "blockingDetails": [
+                    "publish plan requires an issue-lint result before promotion"
+                ],
+            }
+            quarantined_count += 1
+            continue
+
+        lint_missing_required = bool(issue_lint_result.get("missingRequired"))
+        lint_metadata_errors = bool(issue_lint_result.get("metadataErrors"))
+        lint_has_blocking_ambiguity = bool(
+            issue_lint_result.get("highRiskBlockingAmbiguity")
+        )
+        if (
+            not issue_lint_result.get("executionReady", False)
+            or lint_missing_required
+            or lint_metadata_errors
+            or lint_has_blocking_ambiguity
+        ):
+            entry["promotion"] = {"decision": "quarantine", "reason": "issue_lint_blocked"}
+            entry["quarantine"] = {
+                "reason": "issue_lint_blocked",
+                "blockingDetails": _roadmap_issue_set_blocking_details(issue_lint_result)
+                or ["issue-lint did not mark this draft safe to promote"],
+            }
+            quarantined_count += 1
+            continue
+
+        entry["promotion"] = {"decision": "promote", "reason": "issue_lint_clean"}
+        promoted_count += 1
+
+    return {
+        "schemaVersion": 1,
+        "artifactType": "roadmap_continuity_issue_set_publish_plan",
+        "generatedAt": planning_pack.get("generatedAt"),
+        "sourceArtifact": {
+            "artifactType": planning_pack.get("artifactType"),
+            "generatedAt": planning_pack.get("generatedAt"),
+            "evaluation": evaluation,
+            "target": copy.deepcopy(source_artifact.get("target")),
+        },
+        "routing": {
+            "lane": "meta",
+            "publishTarget": "roadmap_continuity_issue_set",
+        },
+        "continuityEnvelope": copy.deepcopy(continuity_envelope),
+        "issueSet": issue_set,
+        "summary": {
+            "issueCount": len(issue_set),
+            "promotedCount": promoted_count,
+            "draftCount": draft_count,
+            "quarantinedCount": quarantined_count,
+        },
+    }
+
+
 def _build_continuity_envelope(
     *,
     source_artifact: dict[str, Any],
