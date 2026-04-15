@@ -120,6 +120,10 @@ def collect_loop_status(
             session_name=session_name,
             capture_lines=capture_lines,
         )
+        snapshot = health_mirror.apply_persisted_failure_tracking(
+            snapshot,
+            health_snapshot_path,
+        )
         observation_error = None
     except health_mirror.HealthMirrorError as exc:
         snapshot = {
