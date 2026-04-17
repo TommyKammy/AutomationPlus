@@ -281,6 +281,71 @@ class ObsidianGeneratedSyncTests(unittest.TestCase):
                 "target_path_not_allowed",
             )
 
+    def test_curated_note_patch_blocks_unsafe_or_unreadable_source_notes(self) -> None:
+        cases = (
+            (
+                obsidian_sync.UnsafeGeneratedPathError("generated sync path is not safely reachable"),
+                "target_path_not_safely_reachable",
+            ),
+            (PermissionError(errno.EACCES, "Permission denied"), "target_note_unreadable"),
+        )
+
+        for raised_error, expected_reason_code in cases:
+            with self.subTest(reason_code=expected_reason_code):
+                with tempfile.TemporaryDirectory() as tempdir:
+                    workspace = Path(tempdir)
+                    target_path = workspace / "obsidian" / "roadmap" / "quarterly-plan.md"
+                    target_path.parent.mkdir(parents=True)
+                    target_path.write_text(
+                        "# Quarterly Plan\n\nStatus: Draft\n",
+                        encoding="utf-8",
+                    )
+
+                    with patch(
+                        "automationplus.obsidian_sync._read_text_no_symlinks",
+                        side_effect=raised_error,
+                    ):
+                        artifact = obsidian_sync.apply_curated_note_patch_artifact(
+                            workspace_root=workspace,
+                            vault_root=workspace,
+                            patch_artifact={
+                                "artifactType": "roadmap_continuity_note_patch_plan",
+                                "approval": {"status": "approved"},
+                                "patches": [
+                                    {
+                                        "targetPath": "obsidian/roadmap/quarterly-plan.md",
+                                        "operation": "replace_text",
+                                        "matchText": "Status: Draft",
+                                        "replacementText": "Status: Confirmed",
+                                    }
+                                ],
+                            },
+                            loop_status_payload=self._healthy_loop_status(),
+                            generated_at="2026-04-15T10:00:00Z",
+                        )
+
+                    self.assertEqual(artifact["decision"]["status"], "blocked")
+                    self.assertEqual(
+                        artifact["patches"][0]["decision"]["reasonCode"],
+                        expected_reason_code,
+                    )
+                    self.assertEqual(
+                        target_path.read_text(encoding="utf-8"),
+                        "# Quarterly Plan\n\nStatus: Draft\n",
+                    )
+                    quarantine_path = (
+                        workspace
+                        / ".codex-supervisor"
+                        / "generated"
+                        / "obsidian"
+                        / "quarantine.json"
+                    )
+                    quarantine = json.loads(quarantine_path.read_text(encoding="utf-8"))
+                    self.assertEqual(
+                        quarantine["patches"][0]["decision"]["reasonCode"],
+                        expected_reason_code,
+                    )
+
     def test_curated_note_patch_batch_failures_do_not_leave_partial_mutations(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             workspace = Path(tempdir)
@@ -353,6 +418,67 @@ class ObsidianGeneratedSyncTests(unittest.TestCase):
             quarantine_path = workspace / ".codex-supervisor" / "generated" / "obsidian" / "quarantine.json"
             quarantine = json.loads(quarantine_path.read_text(encoding="utf-8"))
             self.assertEqual(quarantine["decision"]["status"], "blocked")
+            self.assertEqual(quarantine["writeState"]["contentChangedBeforeFailure"], True)
+            self.assertEqual(quarantine["writeState"]["rollbackStatus"], "restored")
+
+    def test_curated_note_patch_rolls_back_in_flight_write_after_late_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            workspace = Path(tempdir)
+            target_path = workspace / "obsidian" / "roadmap" / "quarterly-plan.md"
+            target_path.parent.mkdir(parents=True)
+            target_path.write_text("# Quarterly Plan\n\nStatus: Draft\n", encoding="utf-8")
+
+            original_write_text_atomic = obsidian_sync._write_text_atomic
+            write_calls: list[tuple[Path, str]] = []
+
+            def fail_after_write(root: Path, path: Path, content: str) -> None:
+                write_calls.append((path, content))
+                original_write_text_atomic(root, path, content)
+                if len(write_calls) == 1:
+                    raise OSError(errno.EIO, "late write failure after replace")
+
+            with patch(
+                "automationplus.obsidian_sync._write_text_atomic",
+                side_effect=fail_after_write,
+            ):
+                artifact = obsidian_sync.apply_curated_note_patch_artifact(
+                    workspace_root=workspace,
+                    vault_root=workspace,
+                    patch_artifact={
+                        "artifactType": "roadmap_continuity_note_patch_plan",
+                        "approval": {"status": "approved"},
+                        "patches": [
+                            {
+                                "targetPath": "obsidian/roadmap/quarterly-plan.md",
+                                "operation": "replace_text",
+                                "matchText": "Status: Draft",
+                                "replacementText": "Status: Confirmed",
+                            }
+                        ],
+                    },
+                    loop_status_payload=self._healthy_loop_status(),
+                    generated_at="2026-04-15T10:00:00Z",
+                )
+
+            self.assertEqual(artifact["decision"]["status"], "blocked")
+            self.assertEqual(artifact["writeState"]["contentChanged"], False)
+            self.assertEqual(artifact["writeState"]["contentChangedBeforeFailure"], True)
+            self.assertEqual(artifact["writeState"]["rollbackStatus"], "restored")
+            self.assertEqual(
+                artifact["patches"][0]["decision"]["reasonCode"],
+                "target_write_failed",
+            )
+            self.assertEqual(
+                target_path.read_text(encoding="utf-8"),
+                "# Quarterly Plan\n\nStatus: Draft\n",
+            )
+            self.assertGreaterEqual(len(write_calls), 2)
+            self.assertEqual(write_calls[0][1], "# Quarterly Plan\n\nStatus: Confirmed\n")
+            self.assertEqual(write_calls[1][1], "# Quarterly Plan\n\nStatus: Draft\n")
+            quarantine_path = workspace / ".codex-supervisor" / "generated" / "obsidian" / "quarantine.json"
+            quarantine = json.loads(quarantine_path.read_text(encoding="utf-8"))
+            self.assertEqual(quarantine["decision"]["status"], "blocked")
+            self.assertEqual(quarantine["writeState"]["contentChanged"], False)
             self.assertEqual(quarantine["writeState"]["contentChangedBeforeFailure"], True)
             self.assertEqual(quarantine["writeState"]["rollbackStatus"], "restored")
 

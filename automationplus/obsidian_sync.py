@@ -489,12 +489,30 @@ def apply_curated_note_patch_artifact(
 
             try:
                 original_content = _read_text_no_symlinks(vault_root, resolved_target_path)
-            except (FileNotFoundError, UnsafeGeneratedPathError):
+            except FileNotFoundError:
                 artifact["patches"].append(
                     _blocked_patch_result(
                         target_path=target_path,
                         operation=operation,
                         reason_code="target_note_missing",
+                    )
+                )
+                continue
+            except UnsafeGeneratedPathError:
+                artifact["patches"].append(
+                    _blocked_patch_result(
+                        target_path=target_path,
+                        operation=operation,
+                        reason_code="target_path_not_safely_reachable",
+                    )
+                )
+                continue
+            except OSError:
+                artifact["patches"].append(
+                    _blocked_patch_result(
+                        target_path=target_path,
+                        operation=operation,
+                        reason_code="target_note_unreadable",
                     )
                 )
                 continue
@@ -547,14 +565,21 @@ def apply_curated_note_patch_artifact(
         if entry["updatedContent"] != entry["originalContent"]
     ]
     applied_entries: list[dict[str, Any]] = []
+    current_entry: Optional[dict[str, Any]] = None
     try:
         for entry in changed_writes:
+            current_entry = entry
             _write_text_atomic(vault_root, entry["resolvedTargetPath"], entry["updatedContent"])
             applied_entries.append(entry)
+            current_entry = None
     except (UnsafeGeneratedPathError, OSError) as exc:
         restored_paths: set[str] = set()
         rollback_failed = False
-        for entry in reversed(applied_entries):
+        rollback_entries = list(applied_entries)
+        if current_entry is not None:
+            rollback_entries.append(current_entry)
+
+        for entry in reversed(rollback_entries):
             try:
                 _write_text_atomic(vault_root, entry["resolvedTargetPath"], entry["originalContent"])
                 restored_paths.add(str(entry["resolvedTargetPath"]))
@@ -582,7 +607,13 @@ def apply_curated_note_patch_artifact(
             if isinstance(exc, UnsafeGeneratedPathError)
             else "target_write_failed"
         )
-        failed_entry = changed_writes[failed_index] if failed_index < len(changed_writes) else None
+        failed_entry = (
+            current_entry
+            if current_entry is not None
+            else changed_writes[failed_index]
+            if failed_index < len(changed_writes)
+            else None
+        )
         if failed_entry is not None:
             for patch_result in failed_entry["patchResults"]:
                 patch_result["decision"] = {
@@ -605,7 +636,7 @@ def apply_curated_note_patch_artifact(
         _set_curated_patch_write_state(
             artifact,
             content_changed=rollback_failed,
-            content_changed_before_failure=bool(applied_entries),
+            content_changed_before_failure=bool(applied_entries or current_entry is not None),
             rollback_status="failed" if rollback_failed else "restored",
         )
         _write_json_atomic(workspace_root, quarantine_path, artifact)
