@@ -330,6 +330,20 @@ def _blocked_patch_result(
     }
 
 
+def _set_curated_patch_write_state(
+    artifact: dict[str, Any],
+    *,
+    content_changed: bool,
+    content_changed_before_failure: bool,
+    rollback_status: str,
+) -> None:
+    artifact["writeState"] = {
+        "contentChanged": content_changed,
+        "contentChangedBeforeFailure": content_changed_before_failure,
+        "rollbackStatus": rollback_status,
+    }
+
+
 def apply_curated_note_patch_artifact(
     *,
     workspace_root: Path,
@@ -348,6 +362,12 @@ def apply_curated_note_patch_artifact(
         patch_artifact=patch_artifact,
         loop_status_payload=loop_status_payload,
         generated_at=generated_at,
+    )
+    _set_curated_patch_write_state(
+        artifact,
+        content_changed=False,
+        content_changed_before_failure=False,
+        rollback_status="not_needed",
     )
 
     if not _service_is_safe(loop_status_payload):
@@ -405,7 +425,8 @@ def apply_curated_note_patch_artifact(
         _write_json_atomic(workspace_root, quarantine_path, artifact)
         return artifact
 
-    pending_writes: list[tuple[Path, str, dict[str, Any]]] = []
+    pending_writes_by_target: dict[str, dict[str, Any]] = {}
+    approved_patch_results: list[dict[str, Any]] = []
     for patch in patches:
         target_path = patch.get("targetPath")
         operation = patch.get("operation")
@@ -441,16 +462,6 @@ def apply_curated_note_patch_artifact(
             )
             continue
 
-        if not resolved_target_path.exists():
-            artifact["patches"].append(
-                _blocked_patch_result(
-                    target_path=target_path,
-                    operation=operation,
-                    reason_code="target_note_missing",
-                )
-            )
-            continue
-
         match_text = patch.get("matchText")
         replacement_text = patch.get("replacementText")
         if not isinstance(match_text, str) or not isinstance(replacement_text, str):
@@ -463,19 +474,59 @@ def apply_curated_note_patch_artifact(
             )
             continue
 
-        try:
-            original_content = _read_text_no_symlinks(vault_root, resolved_target_path)
-        except (FileNotFoundError, UnsafeGeneratedPathError):
-            artifact["patches"].append(
-                _blocked_patch_result(
-                    target_path=target_path,
-                    operation=operation,
-                    reason_code="target_note_missing",
+        target_write_key = str(resolved_target_path)
+        pending_write = pending_writes_by_target.get(target_write_key)
+        if pending_write is None:
+            if not resolved_target_path.exists():
+                artifact["patches"].append(
+                    _blocked_patch_result(
+                        target_path=target_path,
+                        operation=operation,
+                        reason_code="target_note_missing",
+                    )
                 )
-            )
-            continue
+                continue
 
-        if original_content.count(match_text) != 1:
+            try:
+                original_content = _read_text_no_symlinks(vault_root, resolved_target_path)
+            except FileNotFoundError:
+                artifact["patches"].append(
+                    _blocked_patch_result(
+                        target_path=target_path,
+                        operation=operation,
+                        reason_code="target_note_missing",
+                    )
+                )
+                continue
+            except UnsafeGeneratedPathError:
+                artifact["patches"].append(
+                    _blocked_patch_result(
+                        target_path=target_path,
+                        operation=operation,
+                        reason_code="target_path_not_safely_reachable",
+                    )
+                )
+                continue
+            except OSError:
+                artifact["patches"].append(
+                    _blocked_patch_result(
+                        target_path=target_path,
+                        operation=operation,
+                        reason_code="target_note_unreadable",
+                    )
+                )
+                continue
+
+            pending_write = {
+                "resolvedTargetPath": resolved_target_path,
+                "originalContent": original_content,
+                "updatedContent": original_content,
+                "patchResults": [],
+            }
+            pending_writes_by_target[target_write_key] = pending_write
+
+        current_content = pending_write["updatedContent"]
+        if current_content.count(match_text) != 1:
             artifact["patches"].append(
                 _blocked_patch_result(
                     target_path=target_path,
@@ -485,23 +536,20 @@ def apply_curated_note_patch_artifact(
             )
             continue
 
-        updated_content = original_content.replace(match_text, replacement_text, 1)
-        pending_writes.append(
-            (
-                resolved_target_path,
-                updated_content,
-                {
-                    "targetPath": target_path,
-                    "operation": operation,
-                    "decision": {
-                        "status": "approved",
-                        "reasonCode": "patch_within_policy",
-                    },
-                },
-            )
-        )
+        updated_content = current_content.replace(match_text, replacement_text, 1)
+        patch_result = {
+            "targetPath": target_path,
+            "operation": operation,
+            "decision": {
+                "status": "approved",
+                "reasonCode": "patch_within_policy",
+            },
+        }
+        pending_write["updatedContent"] = updated_content
+        pending_write["patchResults"].append(patch_result)
+        approved_patch_results.append(patch_result)
 
-    if len(pending_writes) != len(patches):
+    if len(approved_patch_results) != len(patches):
         artifact["decision"] = {
             "status": "blocked",
             "reasonCode": "curated_note_patch_policy_violation",
@@ -509,31 +557,106 @@ def apply_curated_note_patch_artifact(
         _write_json_atomic(workspace_root, quarantine_path, artifact)
         return artifact
 
+    pending_writes = list(pending_writes_by_target.values())
+    artifact["patches"] = approved_patch_results
+    changed_writes = [
+        entry
+        for entry in pending_writes
+        if entry["updatedContent"] != entry["originalContent"]
+    ]
+    applied_entries: list[dict[str, Any]] = []
+    current_entry: Optional[dict[str, Any]] = None
     try:
-        for resolved_target_path, updated_content, patch_result in pending_writes:
-            _write_text_atomic(vault_root, resolved_target_path, updated_content)
+        for entry in changed_writes:
+            current_entry = entry
+            _write_text_atomic(vault_root, entry["resolvedTargetPath"], entry["updatedContent"])
+            applied_entries.append(entry)
+            current_entry = None
+    except (UnsafeGeneratedPathError, OSError) as exc:
+        restored_paths: set[str] = set()
+        rollback_failed = False
+        rollback_entries = list(applied_entries)
+        if current_entry is not None:
+            rollback_entries.append(current_entry)
+
+        for entry in reversed(rollback_entries):
+            try:
+                _write_text_atomic(vault_root, entry["resolvedTargetPath"], entry["originalContent"])
+                restored_paths.add(str(entry["resolvedTargetPath"]))
+            except (UnsafeGeneratedPathError, OSError):
+                rollback_failed = True
+
+        for entry in applied_entries:
+            decision = (
+                {
+                    "status": "rolled_back",
+                    "reasonCode": "patch_reverted_after_batch_failure",
+                }
+                if str(entry["resolvedTargetPath"]) in restored_paths
+                else {
+                    "status": "rollback_failed",
+                    "reasonCode": "patch_revert_failed_after_batch_failure",
+                }
+            )
+            for patch_result in entry["patchResults"]:
+                patch_result["decision"] = dict(decision)
+
+        failed_index = len(applied_entries)
+        failure_reason_code = (
+            "target_path_not_safely_reachable"
+            if isinstance(exc, UnsafeGeneratedPathError)
+            else "target_write_failed"
+        )
+        failed_entry = (
+            current_entry
+            if current_entry is not None
+            else changed_writes[failed_index]
+            if failed_index < len(changed_writes)
+            else None
+        )
+        if failed_entry is not None:
+            for patch_result in failed_entry["patchResults"]:
+                patch_result["decision"] = {
+                    "status": "blocked",
+                    "reasonCode": failure_reason_code,
+                }
+        for entry in pending_writes:
+            if entry in applied_entries or entry is failed_entry:
+                continue
+            for patch_result in entry["patchResults"]:
+                patch_result["decision"] = {
+                    "status": "blocked",
+                    "reasonCode": "not_applied_due_to_batch_failure",
+                }
+
+        artifact["decision"] = {
+            "status": "blocked",
+            "reasonCode": "curated_note_patch_policy_violation",
+        }
+        _set_curated_patch_write_state(
+            artifact,
+            content_changed=rollback_failed,
+            content_changed_before_failure=bool(applied_entries or current_entry is not None),
+            rollback_status="failed" if rollback_failed else "restored",
+        )
+        _write_json_atomic(workspace_root, quarantine_path, artifact)
+        return artifact
+
+    for entry in pending_writes:
+        for patch_result in entry["patchResults"]:
             patch_result["decision"] = {
                 "status": "applied",
                 "reasonCode": "patch_applied",
             }
-            artifact["patches"].append(patch_result)
-    except UnsafeGeneratedPathError:
-        artifact["decision"] = {
-            "status": "blocked",
-            "reasonCode": "curated_note_patch_policy_violation",
-        }
-        artifact["patches"] = [
-            _blocked_patch_result(
-                target_path="",
-                operation=None,
-                reason_code="target_path_not_safely_reachable",
-            )
-        ]
-        _write_json_atomic(workspace_root, quarantine_path, artifact)
-        return artifact
 
     artifact["decision"] = {
         "status": "applied",
         "reasonCode": "curated_note_patch_applied",
     }
+    _set_curated_patch_write_state(
+        artifact,
+        content_changed=bool(changed_writes),
+        content_changed_before_failure=False,
+        rollback_status="not_needed",
+    )
     return artifact
