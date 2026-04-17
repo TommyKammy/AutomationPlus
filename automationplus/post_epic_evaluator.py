@@ -41,6 +41,10 @@ class PostEpicEvaluationJob:
     generated_at: Optional[str] = None
 
 
+ROADMAP_CONTINUITY_CURATED_NOTE_PATCH_ROOT = "obsidian/roadmap/"
+ROADMAP_CONTINUITY_CURATED_NOTE_PATCH_OPERATION = "replace_text"
+
+
 def evaluate_completed_epic(job: PostEpicEvaluationJob) -> dict[str, Any]:
     completed_child_issue_count = sum(
         1 for issue in job.child_issues if issue.conclusion == "completed"
@@ -625,6 +629,76 @@ def _validate_roadmap_proposal(index: int, proposal: Any) -> dict[str, Any]:
                 f"proposal[{index}].{field_name} must be a non-empty list of non-empty strings"
             )
         normalized[field_name] = normalized_list
+
+    curated_note_patches = proposal.get("curatedNotePatches")
+    if curated_note_patches is not None:
+        if not isinstance(curated_note_patches, list) or not curated_note_patches:
+            raise ValueError(
+                f"proposal[{index}].curatedNotePatches must be a non-empty list of patch objects"
+            )
+        normalized["curatedNotePatches"] = [
+            _validate_curated_note_patch(index, patch_index, patch)
+            for patch_index, patch in enumerate(curated_note_patches)
+        ]
+
+    return normalized
+
+
+def _validate_curated_note_patch(
+    proposal_index: int,
+    patch_index: int,
+    patch: Any,
+) -> dict[str, str]:
+    if not isinstance(patch, dict):
+        raise ValueError(
+            f"proposal[{proposal_index}].curatedNotePatches[{patch_index}] must be an object"
+        )
+
+    required_fields = [
+        "targetPath",
+        "operation",
+        "matchText",
+        "replacementText",
+    ]
+    missing_fields = [field for field in required_fields if field not in patch]
+    if missing_fields:
+        raise ValueError(
+            "proposal"
+            f"[{proposal_index}].curatedNotePatches[{patch_index}] missing required fields: "
+            + ", ".join(missing_fields)
+        )
+
+    normalized: dict[str, str] = {}
+    for field_name in required_fields:
+        raw_value = patch.get(field_name)
+        if not isinstance(raw_value, str) or not raw_value.strip():
+            raise ValueError(
+                "proposal"
+                f"[{proposal_index}].curatedNotePatches[{patch_index}].{field_name} "
+                "must be a non-empty string"
+            )
+        normalized[field_name] = raw_value.strip()
+
+    if normalized["operation"] != ROADMAP_CONTINUITY_CURATED_NOTE_PATCH_OPERATION:
+        raise ValueError(
+            "proposal"
+            f"[{proposal_index}].curatedNotePatches[{patch_index}].operation must be "
+            f"{ROADMAP_CONTINUITY_CURATED_NOTE_PATCH_OPERATION}"
+        )
+
+    target_path = normalized["targetPath"]
+    if Path(target_path).is_absolute() or ".." in Path(target_path).parts:
+        raise ValueError(
+            "proposal"
+            f"[{proposal_index}].curatedNotePatches[{patch_index}].targetPath must remain "
+            "relative to the curated roadmap root"
+        )
+    if not target_path.startswith(ROADMAP_CONTINUITY_CURATED_NOTE_PATCH_ROOT):
+        raise ValueError(
+            "proposal"
+            f"[{proposal_index}].curatedNotePatches[{patch_index}].targetPath must stay under "
+            f"{ROADMAP_CONTINUITY_CURATED_NOTE_PATCH_ROOT}"
+        )
 
     return normalized
 
@@ -1352,6 +1426,110 @@ def build_roadmap_continuity_issue_set_publish_plan(
             "quarantinedCount": quarantined_count,
         },
     }
+
+
+def build_roadmap_continuity_note_patch_plan(
+    planning_pack: dict[str, Any],
+    *,
+    issue_set_publish_plan: dict[str, Any],
+) -> dict[str, Any]:
+    continuity_envelope = planning_pack.get("continuityEnvelope")
+    if not isinstance(continuity_envelope, dict):
+        continuity_envelope = {}
+
+    proposals = planning_pack.get("proposals")
+    if not isinstance(proposals, list):
+        proposals = []
+    proposals = [copy.deepcopy(proposal) for proposal in proposals if isinstance(proposal, dict)]
+
+    issue_set = issue_set_publish_plan.get("issueSet")
+    if not isinstance(issue_set, list):
+        issue_set = []
+
+    promotion_by_publish_key: dict[str, str] = {}
+    for entry in issue_set:
+        if not isinstance(entry, dict):
+            continue
+        publish_key = entry.get("publishKey")
+        promotion = entry.get("promotion")
+        if not isinstance(publish_key, str) or not isinstance(promotion, dict):
+            continue
+        decision = promotion.get("decision")
+        if isinstance(decision, str):
+            promotion_by_publish_key[publish_key] = decision
+
+    proposed_patch_count = 0
+    approved_patches: list[dict[str, str]] = []
+    withheld_reason = "no_curated_note_patches_proposed"
+
+    curated_note_patch_sets: list[tuple[str, list[dict[str, str]]]] = []
+    for proposal in proposals:
+        curated_note_patches = proposal.get("curatedNotePatches")
+        if not isinstance(curated_note_patches, list) or not curated_note_patches:
+            continue
+        proposed_patch_count += len(curated_note_patches)
+        proposal_key = proposal.get("proposalKey")
+        if isinstance(proposal_key, str) and proposal_key:
+            curated_note_patch_sets.append(
+                (f"epic:{proposal_key}", copy.deepcopy(curated_note_patches))
+            )
+
+    if continuity_envelope.get("promotionState") != "publishable":
+        withheld_reason = "continuity_promotion_state_not_publishable"
+    elif promotion_by_publish_key.get("roadmap") != "promote":
+        withheld_reason = "roadmap_issue_not_approved_for_note_updates"
+    else:
+        for publish_key, curated_note_patches in curated_note_patch_sets:
+            if promotion_by_publish_key.get(publish_key) != "promote":
+                withheld_reason = "proposal_issue_not_approved_for_note_updates"
+                approved_patches = []
+                break
+
+            approved_patches.extend(copy.deepcopy(curated_note_patches))
+
+        if approved_patches:
+            withheld_reason = "approved_continuity_artifacts_allow_note_updates"
+
+    approved_patch_count = len(approved_patches)
+    withheld_patch_count = proposed_patch_count - approved_patch_count
+
+    source_artifact = planning_pack.get("sourceArtifact")
+    if not isinstance(source_artifact, dict):
+        source_artifact = {}
+
+    note_patch_plan = {
+        "schemaVersion": 1,
+        "artifactType": "roadmap_continuity_note_patch_plan",
+        "generatedAt": planning_pack.get("generatedAt"),
+        "sourceArtifacts": {
+            "planningPack": {
+                "artifactType": planning_pack.get("artifactType"),
+                "generatedAt": planning_pack.get("generatedAt"),
+                "target": copy.deepcopy(source_artifact.get("target")),
+            },
+            "issueSetPublishPlan": {
+                "artifactType": issue_set_publish_plan.get("artifactType"),
+                "generatedAt": issue_set_publish_plan.get("generatedAt"),
+            },
+        },
+        "routing": {
+            "lane": "meta",
+            "publishTarget": "roadmap_continuity_note_patch",
+        },
+        "continuityEnvelope": copy.deepcopy(continuity_envelope),
+        "approval": {
+            "status": "approved" if approved_patches else "withheld",
+            "reason": withheld_reason,
+        },
+        "patches": approved_patches,
+        "summary": {
+            "proposalCount": len(proposals),
+            "proposedPatchCount": proposed_patch_count,
+            "approvedPatchCount": approved_patch_count,
+            "withheldPatchCount": withheld_patch_count,
+        },
+    }
+    return note_patch_plan
 
 
 def _build_continuity_envelope(
