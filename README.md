@@ -23,6 +23,87 @@ At the current stage, this repository provides:
 
 In practice, AutomationPlus is the "meta lane" around `codex-supervisor`, not a second supervisor.
 
+## n8n-Centered Workflow
+
+The repository does not bundle an n8n workflow export today, but the intended operating model is that n8n acts as the outer orchestrator around the artifact and CLI surfaces implemented here.
+
+Read the diagram below as:
+
+- `n8n` owns trigger routing, scheduling, and cross-system wiring
+- `AutomationPlus` owns bounded artifact generation, policy checks, and note/output contracts
+- `codex-supervisor` owns the durable issue execution loop, PR lifecycle, and worktree-based implementation lane
+- `Obsidian` and `GitHub` stay outside the core execution lane and are only touched through explicit gates
+
+```mermaid
+flowchart TD
+    A["Triggers\nGitHub events / schedule / manual operator action"] --> B["n8n\nOuter workflow orchestrator"]
+
+    B --> C{"Which lane?"}
+
+    C --> D["Epic completion lane"]
+    C --> E["Loop health lane"]
+    C --> F["Roadmap continuity lane"]
+    C --> G["Operator diagnostics lane"]
+
+    D --> D1["AutomationPlus\npost_epic_evaluator"]
+    D1 --> D2["Artifacts\npost-epic evaluation\nfindings pack\nfollow-up issue publish plan"]
+    D2 --> D3{"Promotion gate\nissue-lint / duplicate checks / policy"}
+    D3 -->|approved| D4["GitHub\nfollow-up issue draft or promote"]
+    D3 -->|blocked| D5["Quarantine / draft-only artifact"]
+
+    E --> E1["AutomationPlus\ncsctl loop-status\nhealth_mirror\nrestart_decision"]
+    E1 --> E2["Artifacts\nloop health snapshot\nfailure registry\nrestart decision"]
+    E2 --> E3{"Failure policy"}
+    E3 -->|healthy| E4["n8n records healthy state"]
+    E3 -->|transient failure| E5["Bounded restart path\nvia supervisor-safe command surface"]
+    E3 -->|repeated or unsafe| E6["Hold / quarantine\noperator-visible stop state"]
+
+    F --> F1["AutomationPlus\nroadmap proposal pack\nplanning pack\ncontinuity envelope"]
+    F1 --> F2["Artifacts\nproposal pack\nplanning pack\nissue-set publish plan\nnote patch plan"]
+    F2 --> F3{"Publish and patch gates"}
+    F3 -->|approved issues| F4["GitHub\nroadmap / epic / child issue set"]
+    F3 -->|approved notes| F5["Obsidian\ncurated roadmap patch lane"]
+    F3 -->|withheld| F6["Draft / quarantine artifacts"]
+
+    G --> G1["AutomationPlus\ncsctl status-json / doctor-json / explain-json"]
+    G1 --> G2["n8n notification or operator dashboard"]
+
+    E5 --> H["codex-supervisor\nrun-once / requeue / loop control boundary"]
+    D4 --> H
+    F4 --> H
+
+    H --> I["Codex worktree execution\nimplementation / PR / CI / review"]
+    I --> J["GitHub PR and merge outcomes"]
+    J --> D
+
+    F5 --> K["Obsidian vault\nbounded generated or curated updates"]
+```
+
+### What This Means In Practice
+
+If you think about the whole system from the outside, n8n is the conductor and AutomationPlus is the contract-heavy policy engine sitting between n8n and the rest of the dev workflow.
+
+- n8n decides when a workflow should run
+- AutomationPlus decides what artifact or bounded action is safe to emit
+- `codex-supervisor` decides how implementation work advances through issues, PRs, CI, and review
+
+That split matters because it keeps "workflow glue" separate from "trusted execution boundaries".
+
+### Current Implementation Status
+
+At this point, the repository already implements most of the AutomationPlus boxes in the diagram:
+
+- Epic completion lane:
+  post-Epic evaluation, findings packs, and follow-up issue publish planning are implemented.
+- Loop health lane:
+  `csctl loop-status`, failure classification, restart decisioning, and bounded stop/hold routing are implemented.
+- Roadmap continuity lane:
+  roadmap proposal packs, planning packs, continuity envelopes, issue-set publish planning, and curated note patch planning are implemented.
+- Obsidian outputs:
+  generated sync and curated roadmap note patch application are implemented with path and safety policies.
+
+The part that is still intentionally external is the n8n workflow definition itself. This README section describes how n8n should sit around the current repository capabilities, not a bundled workflow file shipped inside this repo.
+
 ## Repository Layout
 
 - `automationplus/`
