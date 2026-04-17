@@ -280,6 +280,81 @@ class ObsidianGeneratedSyncTests(unittest.TestCase):
                 "target_path_not_allowed",
             )
 
+    def test_curated_note_patch_batch_failures_do_not_leave_partial_mutations(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            workspace = Path(tempdir)
+            first_target = workspace / "obsidian" / "roadmap" / "first.md"
+            second_target = workspace / "obsidian" / "roadmap" / "second.md"
+            first_target.parent.mkdir(parents=True)
+            first_target.write_text("# First\n\nStatus: Draft\n", encoding="utf-8")
+            second_target.write_text("# Second\n\nStatus: Draft\n", encoding="utf-8")
+
+            original_write_text_atomic = obsidian_sync._write_text_atomic
+            write_calls: list[Path] = []
+
+            def fail_on_second_write(root: Path, path: Path, content: str) -> None:
+                write_calls.append(path)
+                if len(write_calls) == 2:
+                    raise obsidian_sync.UnsafeGeneratedPathError(
+                        "generated sync path is not safely reachable"
+                    )
+                original_write_text_atomic(root, path, content)
+
+            with patch(
+                "automationplus.obsidian_sync._write_text_atomic",
+                side_effect=fail_on_second_write,
+            ):
+                artifact = obsidian_sync.apply_curated_note_patch_artifact(
+                    workspace_root=workspace,
+                    vault_root=workspace,
+                    patch_artifact={
+                        "artifactType": "roadmap_continuity_note_patch_plan",
+                        "approval": {"status": "approved"},
+                        "patches": [
+                            {
+                                "targetPath": "obsidian/roadmap/first.md",
+                                "operation": "replace_text",
+                                "matchText": "Status: Draft",
+                                "replacementText": "Status: Confirmed",
+                            },
+                            {
+                                "targetPath": "obsidian/roadmap/second.md",
+                                "operation": "replace_text",
+                                "matchText": "Status: Draft",
+                                "replacementText": "Status: Confirmed",
+                            },
+                        ],
+                    },
+                    loop_status_payload=self._healthy_loop_status(),
+                    generated_at="2026-04-15T10:00:00Z",
+                )
+
+            self.assertEqual(artifact["decision"]["status"], "blocked")
+            self.assertEqual(artifact["writeState"]["contentChanged"], False)
+            self.assertEqual(artifact["writeState"]["contentChangedBeforeFailure"], True)
+            self.assertEqual(artifact["writeState"]["rollbackStatus"], "restored")
+            self.assertEqual(
+                artifact["patches"][0]["decision"]["reasonCode"],
+                "patch_reverted_after_batch_failure",
+            )
+            self.assertEqual(
+                artifact["patches"][1]["decision"]["reasonCode"],
+                "target_path_not_safely_reachable",
+            )
+            self.assertEqual(
+                first_target.read_text(encoding="utf-8"),
+                "# First\n\nStatus: Draft\n",
+            )
+            self.assertEqual(
+                second_target.read_text(encoding="utf-8"),
+                "# Second\n\nStatus: Draft\n",
+            )
+            quarantine_path = workspace / ".codex-supervisor" / "generated" / "obsidian" / "quarantine.json"
+            quarantine = json.loads(quarantine_path.read_text(encoding="utf-8"))
+            self.assertEqual(quarantine["decision"]["status"], "blocked")
+            self.assertEqual(quarantine["writeState"]["contentChangedBeforeFailure"], True)
+            self.assertEqual(quarantine["writeState"]["rollbackStatus"], "restored")
+
 
 if __name__ == "__main__":
     unittest.main()
