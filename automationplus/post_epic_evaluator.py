@@ -1442,11 +1442,17 @@ def build_roadmap_continuity_note_patch_plan(
         proposals = []
     proposals = [copy.deepcopy(proposal) for proposal in proposals if isinstance(proposal, dict)]
 
+    plan_items = planning_pack.get("planItems")
+    if not isinstance(plan_items, list):
+        plan_items = []
+    plan_items = [copy.deepcopy(item) for item in plan_items if isinstance(item, dict)]
+
     issue_set = issue_set_publish_plan.get("issueSet")
     if not isinstance(issue_set, list):
         issue_set = []
 
     promotion_by_publish_key: dict[str, str] = {}
+    child_promotions_by_proposal_key: dict[str, list[str]] = {}
     for entry in issue_set:
         if not isinstance(entry, dict):
             continue
@@ -1457,12 +1463,38 @@ def build_roadmap_continuity_note_patch_plan(
         decision = promotion.get("decision")
         if isinstance(decision, str):
             promotion_by_publish_key[publish_key] = decision
+            if publish_key.startswith("child:"):
+                draft_issue = entry.get("draftIssue")
+                canonical_metadata = (
+                    draft_issue.get("canonicalMetadata")
+                    if isinstance(draft_issue, dict)
+                    else None
+                )
+                proposal_key = (
+                    canonical_metadata.get("proposalKey")
+                    if isinstance(canonical_metadata, dict)
+                    else None
+                )
+                if isinstance(proposal_key, str) and proposal_key:
+                    child_promotions_by_proposal_key.setdefault(proposal_key, []).append(decision)
 
     proposed_patch_count = 0
     approved_patches: list[dict[str, str]] = []
     withheld_reason = "no_curated_note_patches_proposed"
 
-    curated_note_patch_sets: list[tuple[str, list[dict[str, str]]]] = []
+    required_child_count_by_proposal_key: dict[str, int] = {}
+    for item in plan_items:
+        proposal_key = item.get("proposalKey")
+        item_key = item.get("itemKey")
+        if not isinstance(proposal_key, str) or not proposal_key:
+            continue
+        if not isinstance(item_key, str) or not item_key:
+            continue
+        required_child_count_by_proposal_key[proposal_key] = (
+            required_child_count_by_proposal_key.get(proposal_key, 0) + 1
+        )
+
+    curated_note_patch_sets: list[tuple[str, str, list[dict[str, str]]]] = []
     for proposal in proposals:
         curated_note_patches = proposal.get("curatedNotePatches")
         if not isinstance(curated_note_patches, list) or not curated_note_patches:
@@ -1471,7 +1503,11 @@ def build_roadmap_continuity_note_patch_plan(
         proposal_key = proposal.get("proposalKey")
         if isinstance(proposal_key, str) and proposal_key:
             curated_note_patch_sets.append(
-                (f"epic:{proposal_key}", copy.deepcopy(curated_note_patches))
+                (
+                    proposal_key,
+                    f"epic:{proposal_key}",
+                    copy.deepcopy(curated_note_patches),
+                )
             )
 
     if continuity_envelope.get("promotionState") != "publishable":
@@ -1479,9 +1515,19 @@ def build_roadmap_continuity_note_patch_plan(
     elif promotion_by_publish_key.get("roadmap") != "promote":
         withheld_reason = "roadmap_issue_not_approved_for_note_updates"
     else:
-        for publish_key, curated_note_patches in curated_note_patch_sets:
+        for proposal_key, publish_key, curated_note_patches in curated_note_patch_sets:
             if promotion_by_publish_key.get(publish_key) != "promote":
                 withheld_reason = "proposal_issue_not_approved_for_note_updates"
+                approved_patches = []
+                break
+
+            required_child_count = required_child_count_by_proposal_key.get(proposal_key, 0)
+            child_promotions = child_promotions_by_proposal_key.get(proposal_key, [])
+            if required_child_count and (
+                len(child_promotions) != required_child_count
+                or any(decision != "promote" for decision in child_promotions)
+            ):
+                withheld_reason = "child_issue_not_approved_for_note_updates"
                 approved_patches = []
                 break
 

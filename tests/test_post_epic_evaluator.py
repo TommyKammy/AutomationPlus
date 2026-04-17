@@ -1946,6 +1946,111 @@ Parallelizable: No
             },
         )
 
+    def test_continuity_note_patch_plan_withholds_updates_when_required_child_issue_not_promoted(
+        self,
+    ) -> None:
+        job = PostEpicEvaluationJob(
+            repository_full_name="TommyKammy/AutomationPlus",
+            epic_issue_number=1,
+            epic_issue_title="Epic: Phase 1 foundations for AutomationPlus loop automation",
+            epic_issue_url="https://github.com/TommyKammy/AutomationPlus/issues/1",
+            evaluation_trigger="epic.completed",
+            target_sha="abababababababababababababababababababab",
+            target_ref="refs/heads/main",
+            child_issues=[],
+            generated_at="2026-04-15T05:00:00Z",
+        )
+
+        findings_pack = build_post_epic_findings_pack(evaluate_completed_epic(job))
+        proposal_pack = build_roadmap_proposal_pack(
+            findings_pack,
+            proposals=[
+                {
+                    "proposalKey": "phase-3-roadmap-continuity",
+                    "title": "Phase 3 roadmap continuity envelope",
+                    "summary": "Carry approved roadmap continuity outputs into bounded roadmap note updates.",
+                    "goals": [
+                        "Emit a first-class curated note patch plan from continuity artifacts.",
+                    ],
+                    "constraints": [
+                        "Keep note updates bounded to curated roadmap note paths.",
+                    ],
+                    "candidateIssueTypes": ["epic", "child"],
+                    "publicationIntent": "issue_set_publish",
+                    "curatedNotePatches": [
+                        {
+                            "targetPath": "obsidian/roadmap/quarterly-plan.md",
+                            "operation": "replace_text",
+                            "matchText": "Status: Draft",
+                            "replacementText": "Status: Confirmed",
+                        }
+                    ],
+                }
+            ],
+        )
+        planning_pack = build_planning_pack(
+            proposal_pack,
+            plan_items=[
+                {
+                    "itemKey": "capture-pack-shape",
+                    "proposalKey": "phase-3-roadmap-continuity",
+                    "phase": "design",
+                    "title": "Capture planning-pack shape",
+                    "summary": "Define the machine-readable planning artifact and source metadata.",
+                    "dependsOn": [],
+                }
+            ],
+        )
+        publish_plan = build_roadmap_continuity_issue_set_publish_plan(
+            planning_pack,
+            publish_decisions={
+                "roadmap": "publish",
+                "epic:phase-3-roadmap-continuity": "publish",
+                "child:capture-pack-shape": "draft",
+            },
+            issue_lint_results={
+                "roadmap": {
+                    "executionReady": True,
+                    "missingRequired": [],
+                    "metadataErrors": [],
+                    "highRiskBlockingAmbiguity": None,
+                },
+                "epic:phase-3-roadmap-continuity": {
+                    "executionReady": True,
+                    "missingRequired": [],
+                    "metadataErrors": [],
+                    "highRiskBlockingAmbiguity": None,
+                },
+            },
+        )
+
+        self.assertEqual(planning_pack["continuityEnvelope"]["promotionState"], "publishable")
+        self.assertEqual(
+            [item["promotion"]["decision"] for item in publish_plan["issueSet"]],
+            ["promote", "promote", "draft"],
+        )
+
+        note_patch_plan = build_roadmap_continuity_note_patch_plan(
+            planning_pack,
+            issue_set_publish_plan=publish_plan,
+        )
+
+        self.assertEqual(note_patch_plan["approval"]["status"], "withheld")
+        self.assertEqual(
+            note_patch_plan["approval"]["reason"],
+            "child_issue_not_approved_for_note_updates",
+        )
+        self.assertEqual(note_patch_plan["patches"], [])
+        self.assertEqual(
+            note_patch_plan["summary"],
+            {
+                "proposalCount": 1,
+                "proposedPatchCount": 1,
+                "approvedPatchCount": 0,
+                "withheldPatchCount": 1,
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
